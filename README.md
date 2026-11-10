@@ -1,6 +1,6 @@
 # voxl-pocket-ios
 
-A native iPad client for [voxl](https://github.com/tembo/voxl), the low-latency remote
+A native iPhone and iPad client for [voxl](https://github.com/tembo/voxl), the low-latency remote
 desktop server.
 
 ## Features
@@ -9,11 +9,11 @@ desktop server.
 - Trackpad and touch input, pinch to zoom, two-finger scroll
 - Hardware keyboards and mice, plus the soft keyboard with a key bar for Esc, Tab,
   sticky Shift/Cmd/Ctrl/Opt, ⌘Space, ⌘Tab and arrows
-- Keeps the host at its own resolution by default; can resize it to fit the iPad
+- Keeps the host at its own resolution by default; can resize it to fit the device in landscape
   (Large, Medium, More space) when the server runs with `--enable-resize`
 - Switch between the host's displays
 - Clipboard both ways, text and images
-- Split View, Slide Over and any orientation
+- Portrait and landscape; Split View and Slide Over on iPad
 
 ## Use
 

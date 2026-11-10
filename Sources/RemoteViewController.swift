@@ -682,7 +682,8 @@ final class KeyInput: UIView, UIKeyInput {
     }()
 
     override var canBecomeFirstResponder: Bool { true }
-    override var inputAccessoryView: UIView? { toolbar }
+    private lazy var keyBar = KeyBarScroll(toolbar)
+    override var inputAccessoryView: UIView? { keyBar }
     override var keyCommands: [UIKeyCommand]? { RemoteViewController.systemShortcuts }
     @objc func systemShortcut(_ c: UIKeyCommand) { owner?.systemShortcut(c) }
     var hasText: Bool { true }
@@ -715,4 +716,25 @@ final class KeyInput: UIView, UIKeyInput {
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) { owner?.handlePresses(presses, down: true) }
     override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) { owner?.handlePresses(presses, down: false) }
     override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) { owner?.handlePresses(presses, down: false) }
+}
+
+/// The key bar, scrolled sideways when the screen is narrower than its buttons (iPhone).
+final class KeyBarScroll: UIScrollView {
+    private let bar: UIToolbar
+    private static let minWidth: CGFloat = 1100 // every button shown, no "…" overflow
+
+    init(_ bar: UIToolbar) {
+        self.bar = bar
+        super.init(frame: CGRect(x: 0, y: 0, width: 100, height: 44))
+        autoresizingMask = .flexibleWidth
+        showsHorizontalScrollIndicator = false
+        addSubview(bar)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        bar.frame = CGRect(x: 0, y: 0, width: max(bounds.width, KeyBarScroll.minWidth), height: bounds.height)
+        contentSize = bar.frame.size
+    }
 }
