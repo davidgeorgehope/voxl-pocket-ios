@@ -95,8 +95,9 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
         NSLayoutConstraint.activate([
             status.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             status.centerYAnchor.constraint(equalTo: view.centerYAnchor),
-            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 12),
-            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
+            stack.leadingAnchor.constraint(greaterThanOrEqualTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
             kbGuide.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor),
             kbGuide.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             kbGuide.widthAnchor.constraint(equalToConstant: 1),
