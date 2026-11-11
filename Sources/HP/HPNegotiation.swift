@@ -195,13 +195,7 @@ enum HPNeg {
         guard !rx.isEmpty else { return nil }
         let (msgs, consumed) = cipher.decryptStream(rx)
         rx.removeSubrange(rx.startIndex..<(rx.startIndex + consumed))
-        for m in msgs {
-            if ProcessInfo.processInfo.environment["HP_DEBUG"] == "1", m.count > 700 {
-                let path = "/tmp/ans_\(m.count).bin"
-                try? m.write(to: URL(fileURLWithPath: path))
-            }
-            if let d = HPOffers.canvasDims(m) { return d }
-        }
+        for m in msgs { if let d = HPOffers.canvasDims(m) { return d } }
         return nil
     }
 }
