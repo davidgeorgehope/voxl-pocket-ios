@@ -37,7 +37,9 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         if let want = env["VOXL_AUTOCONNECT"], !want.isEmpty,
            let host = Hosts.all.first(where: { $0.url.contains(want) }) {
             Diagnostics.note("autoconnect", host.url)
-            nav.pushViewController(RemoteViewController(host: host), animated: false)
+            let vc: UIViewController = host.url.lowercased().hasPrefix("hpss://")
+                ? HPRemoteViewController(host: host) : RemoteViewController(host: host)
+            nav.pushViewController(vc, animated: false)
         }
     }
 }

@@ -21,27 +21,34 @@ final class HPVTDecoder {
     /// Build format desc + session. `requireHardware` forces a HW decoder
     /// (create fails if unavailable) — used to answer the 4:4:4 HW question.
     @discardableResult
-    func setParams(vps: Data, sps: Data, pps: Data, requireHardware: Bool = false) -> Bool {
+    func setParams(vps: Data, sps: Data, pps: Data, requireHardware: Bool = false,
+                   outputFormat: OSType = HPVTDecoder.nv24Format) -> Bool {
+        setParams(vps: vps, sps: sps, ppsList: [pps], requireHardware: requireHardware, outputFormat: outputFormat)
+    }
+
+    /// VPS + SPS + every PPS id seen (Apple's tiles can use several PPS ids).
+    @discardableResult
+    func setParams(vps: Data, sps: Data, ppsList: [Data], requireHardware: Bool = false,
+                   outputFormat: OSType = HPVTDecoder.nv24Format) -> Bool {
         teardown()
         var fmtOut: CMFormatDescription?
-        let st: OSStatus = vps.withUnsafeBytes { v in sps.withUnsafeBytes { s in pps.withUnsafeBytes { p in
-            let ptrs: [UnsafePointer<UInt8>] = [
-                v.baseAddress!.assumingMemoryBound(to: UInt8.self),
-                s.baseAddress!.assumingMemoryBound(to: UInt8.self),
-                p.baseAddress!.assumingMemoryBound(to: UInt8.self)]
-            let sizes = [vps.count, sps.count, pps.count]
-            return ptrs.withUnsafeBufferPointer { pp in sizes.withUnsafeBufferPointer { ss in
-                CMVideoFormatDescriptionCreateFromHEVCParameterSets(
-                    allocator: kCFAllocatorDefault, parameterSetCount: 3,
-                    parameterSetPointers: pp.baseAddress!, parameterSetSizes: ss.baseAddress!,
-                    nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &fmtOut)
-            }}
-        }}}
+        let sets = [vps, sps] + ppsList
+        let bufs = sets.map { d -> UnsafeMutablePointer<UInt8> in
+            let p = UnsafeMutablePointer<UInt8>.allocate(capacity: max(d.count, 1)); d.copyBytes(to: p, count: d.count); return p }
+        defer { bufs.forEach { $0.deallocate() } }
+        let ptrs = bufs.map { UnsafePointer($0) }
+        let sizes = sets.map { $0.count }
+        let st: OSStatus = ptrs.withUnsafeBufferPointer { pp in sizes.withUnsafeBufferPointer { ss in
+            CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                allocator: kCFAllocatorDefault, parameterSetCount: sets.count,
+                parameterSetPointers: pp.baseAddress!, parameterSetSizes: ss.baseAddress!,
+                nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &fmtOut)
+        }}
         lastError = st
         guard st == noErr, let fmtOut else { return false }
         fmt = fmtOut
 
-        let destAttrs: [CFString: Any] = [kCVPixelBufferPixelFormatTypeKey: HPVTDecoder.nv24Format]
+        let destAttrs: [CFString: Any] = [kCVPixelBufferPixelFormatTypeKey: outputFormat]
         var spec: [CFString: Any] = [:]
         if requireHardware {
             spec[kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder] = true
@@ -92,10 +99,9 @@ final class HPVTDecoder {
             let sb else { return nil }
         var flagsOut = VTDecodeInfoFlags()
         let st = VTDecompressionSessionDecodeFrame(
-            session, sampleBuffer: sb, flags: [._EnableAsynchronousDecompression], frameRefcon: nil,
+            session, sampleBuffer: sb, flags: [], frameRefcon: nil,   // synchronous: output lands before return
             infoFlagsOut: &flagsOut)
         lastError = st
-        if st == noErr { VTDecompressionSessionWaitForAsynchronousFrames(session) }
         return latest
     }
 

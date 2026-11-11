@@ -32,7 +32,8 @@ final class HPRemoteViewController: UIViewController {
         statusLabel.textColor = .systemGreen
         statusLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         statusLabel.numberOfLines = 0
-        statusLabel.frame = CGRect(x: 8, y: 48, width: view.bounds.width - 16, height: 120)
+        statusLabel.frame = CGRect(x: 8, y: 48, width: view.bounds.width - 16, height: 150)
+        statusLabel.backgroundColor = UIColor.black.withAlphaComponent(0.55)
         statusLabel.text = "connecting \(host.url)…"
         view.addSubview(statusLabel)
 
@@ -53,8 +54,13 @@ final class HPRemoteViewController: UIViewController {
         guard let (hostname, port) = Self.parseHPSS(host.url) else {
             statusLabel.text = "bad hpss url: \(host.url)"; return
         }
-        let pw = Hosts.password(for: host.url) ?? ""
-        let s = HPMediaSession(host: hostname, port: port, username: "", password: pw)
+        let env = ProcessInfo.processInfo.environment
+        let pw = Hosts.password(for: host.url) ?? Self.takeTestPassword() ?? ""
+        let user = Self.hpssUser(host.url) ?? env["VOXL_HP_USER"] ?? ""
+        let s = HPMediaSession(host: hostname, port: port, username: user, password: pw)
+        // Simulator on the same Mac: playing the host's audio back out of the
+        // host would feed it straight into the capture again.
+        s.audioPlayback = env["VOXL_HP_AUDIO_MUTE"] != "1"
         s.onCanvas = { [weak self] w, h in
             DispatchQueue.main.async { self?.canvasSize = CGSize(width: max(w,1), height: max(h,1)) }
         }
@@ -64,8 +70,14 @@ final class HPRemoteViewController: UIViewController {
         s.start()
         statsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self, let st = self.session?.stats else { return }
-            let ff = st.firstFrameMs != nil ? "ok" : "—"
-            self.statusLabel.text = "hpss \(self.host.url)\ncanvas \(Int(self.canvasSize.width))x\(Int(self.canvasSize.height))  frames \(st.frames)  fps \(String(format: "%.1f", st.fps))  firstFrame \(ff)"
+            let ff = st.connectToFirstFrameMs.map { String(format: "%.1fs", $0 / 1000) } ?? "—"
+            let pipe = st.pipelineMs.map { String(format: "%.1f ms", $0) } ?? "—"
+            let text = String(format: "HP %@  canvas %dx%d  %d tiles\nfps %.1f  frames %d  tile pics %d  decErr %d\nvideo %.0f pkt/s  %.1f Mbit/s  rx→canvas %@\naudio AAC-ELD %.0f pkt/s  AUs %d (non-silent %d)  %@\nconnect→first frame %@  bind %@",
+                hostname, st.canvasW, st.canvasH, st.tiles, st.fps, st.frames, st.tileFrames, st.decodeErrors,
+                st.videoPPS, st.videoKbps / 1000, pipe, st.audioPPS, st.audioPackets, st.audioNonSilentAUs,
+                (self.session?.audioPlayback ?? false) ? "playing" : "muted", ff, st.bindIP)
+            self.statusLabel.text = text
+            NSLog("[HPLive] %@", text.replacingOccurrences(of: "\n", with: " | "))
         }
     }
 
@@ -133,6 +145,21 @@ final class HPRemoteViewController: UIViewController {
         super.viewWillDisappear(animated)
         statsTimer?.invalidate(); statsTimer = nil
         session?.stop(); session = nil
+    }
+
+    /// Username rides in the URL query (`hpss://mac:5900?user=name`); the
+    /// password never does (Keychain only).
+    static func hpssUser(_ url: String) -> String? {
+        URLComponents(string: url)?.queryItems?.first { $0.name == "user" }?.value
+    }
+
+    /// Test hook: VOXL_HP_PWFILE names a 0600 file holding the password. It is
+    /// read once, deleted immediately, and kept in memory only (never Keychain).
+    static func takeTestPassword() -> String? {
+        guard let path = ProcessInfo.processInfo.environment["VOXL_HP_PWFILE"],
+              let d = FileManager.default.contents(atPath: path) else { return nil }
+        try? FileManager.default.removeItem(atPath: path)
+        return String(data: d, encoding: .utf8)?.trimmingCharacters(in: .newlines)
     }
 
     /// "hpss://mac.ts.net" or "hpss://mac.ts.net:5900" -> (host, port).

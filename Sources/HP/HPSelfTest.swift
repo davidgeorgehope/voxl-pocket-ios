@@ -105,6 +105,59 @@ enum HPSelfTest {
             NSLog("[HPSelfTest] VTIsHardwareDecodeSupported(HEVC)=%@ (NOTE: in the Simulator this reflects the Mac host GPU, not the iPhone's A18 Pro)", supported ? "true" : "false")
         }
 
+        // 7) SRTP sender -> receiver round trip (PT=101 keepalive path)
+        do {
+            var blob = Data(count: HPSRTPDecryptor.keyBlobLen)
+            _ = blob.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, HPSRTPDecryptor.keyBlobLen, $0.baseAddress!) }
+            let enc = HPSRTPEncryptor(blob: blob, ssrc: 0xA1B2C3D4)
+            let dec = HPSRTPDecryptor(blob: blob)
+            var ok = true
+            for i in 0..<3 {
+                let payload = Data([0x00, 0x68, 0x34, UInt8(i)])
+                guard let (h, p) = dec.decrypt(enc.encrypt(payload)), p == payload, h.count == 12 else { ok = false; break }
+            }
+            add("SRTP encrypt/decrypt round-trip (keepalive)", ok)
+        }
+
+        // 8) the SSRC we put in RTCP == the session id the offer advertises
+        do {
+            let o = HPOffers.createWithSSRCs()
+            let v = HPOffers.offerSSRC(o.video, isVideo: true), a = HPOffers.offerSSRC(o.audio, isVideo: false)
+            add("offer SSRCs match RTCP sender SSRCs", v == o.videoSSRC && a == o.audioSSRC,
+                String(format: "video=0x%08x audio=0x%08x", o.videoSSRC, o.audioSSRC))
+        }
+
+        // 9) RTCP keyframe request shape + SR parse
+        do {
+            let k = HPRTCP.keyframeRequest(sender: 1, target: 2, seq: 3)
+            let sr = HPRTCP.emptySR(0x01020304)
+            let parsed = HPRTCP.senderReports(sr + HPRTCP.emptyRR(5))
+            let ok = k.count == 8 + 20 + 12 + 8 && parsed.count == 1 && parsed[0].ssrc == 0x01020304
+                && abs(parsed[0].wall - Date().timeIntervalSince1970) < 2
+            add("RTCP FIR+PLI+legacy-FIR compound / SR parse", ok, "fir=\(k.count)B")
+        }
+
+        // 10) PPS id parse (ue(v) right after the NAL header)
+        do {
+            let pps0 = Data([0x44, 0x01, 0xC0]), pps3 = Data([0x44, 0x01, 0x20])
+            add("HEVC PPS id parse", HPNALU.ppsID(pps0) == 0 && HPNALU.ppsID(pps3) == 3,
+                "ids=\(HPNALU.ppsID(pps0)),\(HPNALU.ppsID(pps3))")
+        }
+
+        // 11) same-host UDP/TCP bind selection (Simulator shares the Mac's ports)
+        do {
+            let pick = HPMediaSession.autoBindIP(for: "127.0.0.1")
+            let remote = HPMediaSession.autoBindIP(for: "100.64.0.1")
+            add("same-host bind address selection", pick != nil && !(pick ?? "").hasPrefix("127.") && remote == nil,
+                "127.0.0.1 -> bind \(pick ?? "nil"); remote -> wildcard")
+        }
+
+        // 12) AAC-ELD-SBR decode (host cookie) of an AudioToolbox-encoded tone
+        do {
+            let rt = HPAudioDecoder.roundTripTone()
+            add("AAC-ELD-SBR 48k stereo decode (tone round-trip)", rt.ok, rt.detail)
+        }
+
         return r
     }
 

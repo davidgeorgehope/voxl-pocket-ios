@@ -64,7 +64,7 @@ enum HPOffers {
         return out
     }
 
-    private static func plist(mode: Int, audioEnabled: Bool, forceAVC: Bool) -> Data {
+    private static func plist(mode: Int, audioEnabled: Bool, forceAVC: Bool) -> (Data, UInt32) {
         var sid = Data(count: 4)
         _ = sid.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 4, $0.baseAddress!) }
         let sessionId = UInt64(sid[0]) << 24 | UInt64(sid[1]) << 16 | UInt64(sid[2]) << 8 | UInt64(sid[3])
@@ -77,13 +77,46 @@ enum HPOffers {
             "avcMediaStreamNegotiatorMediaBlob": HPZlib.compress(blob),
             "avcMediaStreamOptionCallID": UUID().uuidString.uppercased(),
         ]
-        return (try? PropertyListSerialization.data(fromPropertyList: dict, format: .binary, options: 0)) ?? Data()
+        let data = (try? PropertyListSerialization.data(fromPropertyList: dict, format: .binary, options: 0)) ?? Data()
+        return (data, UInt32(truncatingIfNeeded: sessionId))
     }
 
     /// (videoOffer, audioOffer)
     static func create(audioEnabled: Bool = true, forceAVC: Bool = false) -> (Data, Data) {
-        (plist(mode: 7, audioEnabled: audioEnabled, forceAVC: forceAVC),
-         plist(mode: 8, audioEnabled: audioEnabled, forceAVC: forceAVC))
+        let o = createWithSSRCs(audioEnabled: audioEnabled, forceAVC: forceAVC)
+        return (o.video, o.audio)
+    }
+
+    /// Offers plus the SSRCs they advertise. The offer's session id IS our
+    /// media SSRC: the host accepts RTCP/RTP only from these (video: field
+    /// 5→1, audio: field 3→1); anything else times the session out.
+    static func createWithSSRCs(audioEnabled: Bool = true, forceAVC: Bool = false)
+        -> (video: Data, audio: Data, videoSSRC: UInt32, audioSSRC: UInt32) {
+        let v = plist(mode: 7, audioEnabled: audioEnabled, forceAVC: forceAVC)
+        let a = plist(mode: 8, audioEnabled: audioEnabled, forceAVC: forceAVC)
+        return (v.0, a.0, v.1, a.1)
+    }
+
+    /// Re-read our advertised SSRC from a built offer (self-test cross-check).
+    static func offerSSRC(_ offer: Data, isVideo: Bool) -> UInt32? {
+        guard let pl = try? PropertyListSerialization.propertyList(from: offer, options: [], format: nil) as? [String: Any],
+              let z = pl["avcMediaStreamNegotiatorMediaBlob"] as? Data, let blob = HPZlib.decompress(z) else { return nil }
+        let target = isVideo ? 5 : 3
+        var pos = blob.startIndex
+        while pos < blob.endIndex {
+            let (tag, p1) = PB.readVarint(blob, pos); pos = p1
+            let fn = Int(tag >> 3), wt = Int(tag & 7)
+            if wt == 0 { pos = PB.readVarint(blob, pos).1 }
+            else if wt == 2 {
+                let (ln, p2) = PB.readVarint(blob, pos)
+                if fn == target {
+                    let (itag, q) = PB.readVarint(blob, p2)
+                    if itag == 0x08 { return UInt32(truncatingIfNeeded: PB.readVarint(blob, q).0) }
+                }
+                pos = p2 + Int(ln)
+            } else if wt == 1 { pos += 8 } else if wt == 5 { pos += 4 } else { break }
+        }
+        return nil
     }
 
     /// Parse the server's 0x1c answer msg (0x00 FBU carrying an embedded bplist)

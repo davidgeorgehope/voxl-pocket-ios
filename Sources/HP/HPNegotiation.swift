@@ -80,7 +80,8 @@ enum HPNeg {
 
     struct Negotiated { let cipher: HPStreamCipher; let videoKeyS: Data; let audioKeyS: Data
                         let videoKeyV: Data; let audioKeyV: Data
-                        let canvasW: Int; let canvasH: Int; let tiles: Int }
+                        let canvasW: Int; let canvasH: Int; let tiles: Int
+                        let videoSSRC: UInt32; let audioSSRC: UInt32 }
 
     /// Full negotiation from a freshly-authed socket (post-ServerInit).
     static func negotiate(_ s: HPSocket, ecbKey: Data, forceAVC: Bool = false) throws -> Negotiated {
@@ -112,7 +113,8 @@ enum HPNeg {
 
         // encrypted media offer
         try s.send(cipher.encrypt(setEncodings()))
-        let (videoOffer, audioOffer) = HPOffers.create(audioEnabled: true, forceAVC: forceAVC)
+        let offers = HPOffers.createWithSSRCs(audioEnabled: true, forceAVC: forceAVC)
+        let (videoOffer, audioOffer) = (offers.video, offers.audio)
         let vkv = randBlob(), vks = randBlob(), akv = randBlob(), aks = randBlob()
         let msg1c = build0x1c(audioOffer: audioOffer, videoOffer: videoOffer, akv: akv, aks: aks, vkv: vkv, vks: vks)
         try s.send(cipher.encrypt(msg1c))
@@ -127,7 +129,8 @@ enum HPNeg {
             attempts += 1
         }
         let (cw, ch, ct) = canvas ?? (0, 0, 0)
-        return Negotiated(cipher: cipher, videoKeyS: vks, audioKeyS: aks, videoKeyV: vkv, audioKeyV: akv, canvasW: cw, canvasH: ch, tiles: ct)
+        return Negotiated(cipher: cipher, videoKeyS: vks, audioKeyS: aks, videoKeyV: vkv, audioKeyV: akv, canvasW: cw, canvasH: ch, tiles: ct,
+                          videoSSRC: offers.videoSSRC, audioSSRC: offers.audioSSRC)
     }
 
     private static func randBlob() -> Data {

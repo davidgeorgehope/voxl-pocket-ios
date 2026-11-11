@@ -9,8 +9,10 @@ final class HPSocket {
     private var fd: Int32 = -1
     enum SockError: Error { case resolve, connect, io(String) }
 
-    func connect(host: String, port: UInt16, timeoutSec: Int = 15) throws {
-        var hints = addrinfo(ai_flags: 0, ai_family: AF_UNSPEC, ai_socktype: SOCK_STREAM,
+    /// `sourceIP` pins the local IPv4 the connection originates from (same-host
+    /// testing: the host sends media back to this address).
+    func connect(host: String, port: UInt16, timeoutSec: Int = 15, sourceIP: String? = nil) throws {
+        var hints = addrinfo(ai_flags: 0, ai_family: sourceIP == nil ? AF_UNSPEC : AF_INET, ai_socktype: SOCK_STREAM,
                              ai_protocol: IPPROTO_TCP, ai_addrlen: 0,
                              ai_canonname: nil, ai_addr: nil, ai_next: nil)
         var res: UnsafeMutablePointer<addrinfo>?
@@ -19,6 +21,13 @@ final class HPSocket {
         var ai: UnsafeMutablePointer<addrinfo>? = info
         while let cur = ai {
             let s = socket(cur.pointee.ai_family, cur.pointee.ai_socktype, cur.pointee.ai_protocol)
+            if s >= 0, let src = sourceIP {
+                var sa = sockaddr_in()
+                sa.sin_family = sa_family_t(AF_INET); sa.sin_port = 0; sa.sin_addr.s_addr = inet_addr(src)
+                let brc = withUnsafePointer(to: &sa) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.bind(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
+                if brc != 0 { Darwin.close(s); throw SockError.io("bind source \(src) errno=\(errno)") }
+            }
             if s >= 0 {
                 if Foundation.connect(s, cur.pointee.ai_addr, cur.pointee.ai_addrlen) == 0 {
                     fd = s
@@ -64,6 +73,18 @@ final class HPSocket {
         let got = tmp.withUnsafeMutableBytes { Foundation.recv(fd, $0.baseAddress, n, 0) }
         return got > 0 ? Data(tmp[0..<got]) : Data()
     }
+
+    /// recv into a scratch buffer: >0 bytes, 0 on timeout, -1 when closed/error.
+    func recvSomeStatus(_ n: Int) -> Int {
+        var tmp = [UInt8](repeating: 0, count: n)
+        let got = tmp.withUnsafeMutableBytes { Foundation.recv(fd, $0.baseAddress, n, 0) }
+        if got > 0 { return got }
+        if got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { return 0 }
+        return -1
+    }
+
+    /// Wake any thread blocked in recv on this socket.
+    func shutdownBoth() { if fd >= 0 { Darwin.shutdown(fd, SHUT_RDWR) } }
 
     func close() { if fd >= 0 { Darwin.close(fd); fd = -1 } }
 }
@@ -225,9 +246,9 @@ enum HPRFB {
     /// Apple two-TCP warmup (TCP #1): open, exchange the ProtocolVersion banner,
     /// dwell ~1.4s, drop. Registers the session with screensharingd so the real
     /// control TCP survives user-context transitions. Best-effort.
-    static func warmupTCP(host: String, port: UInt16, dwell: Double = 1.4) throws {
+    static func warmupTCP(host: String, port: UInt16, dwell: Double = 1.4, sourceIP: String? = nil) throws {
         let s = HPSocket()
-        try s.connect(host: host, port: port)
+        try s.connect(host: host, port: port, sourceIP: sourceIP)
         defer { s.close() }
         _ = try s.recvExact(12)
         try s.send(protocolVersion)
@@ -238,9 +259,10 @@ enum HPRFB {
     }
 
     static func connectAndAuth(host: String, port: UInt16,
-                               username: String, password: String) throws -> (HPSocket, HandshakeResult) {
+                               username: String, password: String,
+                               sourceIP: String? = nil) throws -> (HPSocket, HandshakeResult) {
         let s = HPSocket()
-        try s.connect(host: host, port: port)
+        try s.connect(host: host, port: port, sourceIP: sourceIP)
         _ = try doVersionHandshake(s)
         let ecbKey = try doSRPAuth(s, username: username, password: password)
         let (w, h) = try clientInit(s)

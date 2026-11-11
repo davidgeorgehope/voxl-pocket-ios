@@ -5,6 +5,50 @@ over TCP 5900, targeting the Mac mini (M2 Pro, macOS 26) at
 `davids-mac-mini-1.taile209c0.ts.net`. Clean-room Swift; the AGPL iShareScreen
 project was used only as a protocol spec and for live testing, never copied.
 
+## Live streaming: WORKING (2026-11-11, iOS Simulator on the mini)
+
+`hpss://127.0.0.1:5900?user=davidhope` in the iPhone Simulator, host = the mini
+with its HDMI monitor attached (3840x2160 panel, "looks like" 1920x1080):
+
+- 0x1c answer → **3840x2160 canvas, 4 tiles**, HEVC 4:4:4, 0 decode errors.
+- Sustained over 50 s: **30-33 fps** composited canvas, **~600-700 video pkt/s
+  (~6-7 Mbit/s)**, **rx→canvas ~14 ms** (first RTP packet of a frame →
+  composited 4K BGRA buffer; Simulator VT is software decode).
+- Audio: AAC-ELD-SBR RTP arrives at **100 pkt/s** on the ctrl port, decrypts and
+  decodes; the self-test proves the decoder with the host's magic cookie on a
+  1 kHz tone (RMS 0.355). Playback is muted in the same-host Simulator test
+  (playing the host's audio out of the host feeds it back into the capture).
+- Connect → first frame ~15 s: dominated by screensharingd's own 0x1c
+  re-query loop (the reference client takes the same ~11-15 s).
+
+### Why it used to stall after ~45 packets (root causes, all fixed)
+
+1. **Same-host port collision.** The viewer's UDP ports are symmetric with the
+   host's (5900/5901). Running on the host itself (Simulator, harness) with a
+   wildcard bind steals screensharingd's sockets, so the host stalls after the
+   session-start burst. This is what both clients hit — the headless/HDMI
+   question was a red herring. Fix: for a same-host target, bind UDP and the TCP
+   source to a different local interface (`HPMediaSession.autoBindIP`); on a
+   real iPhone nothing changes (wildcard bind).
+2. **Media endpoint in the 0x1c offer vs RTCP.** The offer's session id IS our
+   SSRC. We sent RTCP as `0x12345678` to the video port; AVConference only
+   accepts RTCP from the negotiated SSRC, on the **ctrl** port (5900). Now:
+   RR (+SR every 5 s) from our video SSRC to :5900 every 0.5 s, FIR+PLI+legacy
+   FIR addressed to the tile SSRC, and the PT=101 SRTP keepalive (`00683400`,
+   our audio SSRC, audio key) every 0.5 s.
+3. **Tiles are one HEVC stream.** The 4 consecutive SSRCs share one DPB (Apple
+   IDRs tile 0 only; tiles 1-3 reference across tiles). One VT session, every
+   tile's VCL NAL fed in arrival order (one NAL per sample, synchronous decode),
+   output routed back to its tile; canvas = stripes at `tile * pictureHeight`
+   (CTU-padded, 544 rows for 2160/4). Per-tile decoders failed every P-frame.
+4. SSRC group adoption (Apple rotates groups during session start; never flip
+   back to an abandoned group), enc1103 TCP kept drained, and the video RTP
+   clock is **~24 kHz** (not 90 kHz).
+
+Run it: `VOXL_URL='hpss://127.0.0.1:5900?user=davidhope' VOXL_AUTOCONNECT=127.0.0.1
+VOXL_HP_PWFILE=<0600 file, deleted on read> VOXL_HP_AUDIO_MUTE=1` (as
+`SIMCTL_CHILD_*`). Self-test: `VOXL_HP_SELFTEST=1` → 13/13.
+
 ## Verified working (against the real mini, `127.0.0.1:5900`, user `davidhope`)
 
 Control-plane crypto, implemented natively in Swift and run against Apple's real

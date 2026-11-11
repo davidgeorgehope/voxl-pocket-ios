@@ -9,6 +9,18 @@ enum HPNALU {
 
     static func nalType(_ nalu: Data) -> Int { nalu.count >= 2 ? Int((nalu[nalu.startIndex] >> 1) & 0x3f) : -1 }
 
+    /// pps_pic_parameter_set_id: the first ue(v) after the 2-byte NAL header.
+    static func ppsID(_ nalu: Data) -> Int {
+        let b = [UInt8](nalu.dropFirst(2).prefix(8))
+        var bit = 0
+        func next() -> Int? { guard bit / 8 < b.count else { return nil }; let v = Int(b[bit / 8] >> (7 - UInt8(bit % 8))) & 1; bit += 1; return v }
+        var zeros = 0
+        while let v = next(), v == 0 { zeros += 1; if zeros > 16 { return 0 } }
+        var val = 0
+        for _ in 0..<zeros { guard let v = next() else { return 0 }; val = val << 1 | v }
+        return (1 << zeros) - 1 + val
+    }
+
     /// Reassemble the RTP payloads belonging to one timestamp group into NALUs.
     static func reassembleGroup(_ payloads: [Data]) -> [Data] {
         var out: [Data] = []
