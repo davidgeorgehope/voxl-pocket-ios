@@ -218,4 +218,17 @@ enum HPRFB {
         let (w, h) = try clientInit(s)
         return HandshakeResult(width: w, height: h, ecbKey: ecbKey)
     }
+
+    /// Like connectThroughServerInit but hands back the live socket so the
+    /// caller can continue into the plaintext/enc1103/media-offer negotiation.
+    /// Caller owns the socket and must close() it.
+    static func connectAndAuth(host: String, port: UInt16,
+                               username: String, password: String) throws -> (HPSocket, HandshakeResult) {
+        let s = HPSocket()
+        try s.connect(host: host, port: port)
+        _ = try doVersionHandshake(s)
+        let ecbKey = try doSRPAuth(s, username: username, password: password)
+        let (w, h) = try clientInit(s)
+        return (s, HandshakeResult(width: w, height: h, ecbKey: ecbKey))
+    }
 }
