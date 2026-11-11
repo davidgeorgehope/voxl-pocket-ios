@@ -79,6 +79,7 @@ enum HPNeg {
     }
 
     struct Negotiated { let cipher: HPStreamCipher; let videoKeyS: Data; let audioKeyS: Data
+                        let videoKeyV: Data; let audioKeyV: Data
                         let canvasW: Int; let canvasH: Int; let tiles: Int }
 
     /// Full negotiation from a freshly-authed socket (post-ServerInit).
@@ -126,7 +127,7 @@ enum HPNeg {
             attempts += 1
         }
         let (cw, ch, ct) = canvas ?? (0, 0, 0)
-        return Negotiated(cipher: cipher, videoKeyS: vks, audioKeyS: aks, canvasW: cw, canvasH: ch, tiles: ct)
+        return Negotiated(cipher: cipher, videoKeyS: vks, audioKeyS: aks, videoKeyV: vkv, audioKeyV: akv, canvasW: cw, canvasH: ch, tiles: ct)
     }
 
     private static func randBlob() -> Data {
@@ -194,7 +195,13 @@ enum HPNeg {
         guard !rx.isEmpty else { return nil }
         let (msgs, consumed) = cipher.decryptStream(rx)
         rx.removeSubrange(rx.startIndex..<(rx.startIndex + consumed))
-        for m in msgs { if let d = HPOffers.canvasDims(m) { return d } }
+        for m in msgs {
+            if ProcessInfo.processInfo.environment["HP_DEBUG"] == "1", m.count > 700 {
+                let path = "/tmp/ans_\(m.count).bin"
+                try? m.write(to: URL(fileURLWithPath: path))
+            }
+            if let d = HPOffers.canvasDims(m) { return d }
+        }
         return nil
     }
 }

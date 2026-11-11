@@ -73,6 +73,9 @@ enum Hosts {
         guard var c = URLComponents(string: t), c.host?.isEmpty == false, c.user == nil, c.password == nil
         else { return nil }
         switch c.scheme?.lowercased() {
+        // Apple High-Performance Screen Sharing: raw TCP (default 5900), no /ws
+        // path, reachable over Tailscale. ATS doesn't apply (not URLSession).
+        case "hpss": c.scheme = "hpss"; return c.string
         case "https", "wss": c.scheme = "wss"
         // iOS allows unencrypted connections only on the local network (ATS).
         case "http", "ws":
@@ -190,7 +193,10 @@ final class HostPickerViewController: UITableViewController {
     }
 
     private func connect(_ host: Host) {
-        navigationController?.pushViewController(RemoteViewController(host: host), animated: true)
+        let vc: UIViewController = host.url.lowercased().hasPrefix("hpss://")
+            ? HPRemoteViewController(host: host)
+            : RemoteViewController(host: host)
+        navigationController?.pushViewController(vc, animated: true)
     }
 
     private func askPassword(_ host: Host, then: @escaping () -> Void) {

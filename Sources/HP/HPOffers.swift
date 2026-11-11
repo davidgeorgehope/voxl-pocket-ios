@@ -91,16 +91,27 @@ enum HPOffers {
     static func canvasDims(_ msg: Data) -> (Int, Int, Int)? {
         guard let first = msg.first, first == 0x00 else { return nil }
         let bytes = [UInt8](msg)
-        // find "bplist"
         let needle = Array("bplist".utf8)
-        var start = -1
-        for i in 0...(max(0, bytes.count - needle.count)) where Array(bytes[i..<min(i+needle.count, bytes.count)]) == needle {
-            start = i; break
+        // The 0x1c video answer can contain several embedded bplists (e.g. a
+        // remote-endpoint-info blob before the AVCMediaStreamNegotiator video
+        // config). Walk every "bplist" occurrence until one yields canvas dims,
+        // mirroring the reference's `idx += 6` scan.
+        var searchFrom = 0
+        while true {
+            var start = -1
+            if needle.count <= bytes.count {
+                for i in searchFrom...(bytes.count - needle.count) where Array(bytes[i..<i+needle.count]) == needle {
+                    start = i; break
+                }
+            }
+            guard start >= 0 else { return nil }
+            searchFrom = start + needle.count
+            if let dims = dimsFromBplist(bytes, start: start) { return dims }
         }
-        guard start >= 0 else { return nil }
-        // Grow the end offset until we parse a *dictionary that carries the
-        // media blob* -- a truncated "bplist00" header alone parses into a
-        // non-dict object, so we must keep going past the first success.
+    }
+
+    /// Try to parse one embedded bplist starting at `start` into canvas dims.
+    private static func dimsFromBplist(_ bytes: [UInt8], start: Int) -> (Int, Int, Int)? {
         var dict: [String: Any]?
         var e = start + 8
         while e <= bytes.count {
@@ -113,7 +124,6 @@ enum HPOffers {
         }
         guard let dict, let blob = dict["avcMediaStreamNegotiatorMediaBlob"] as? Data,
               let dec = HPZlib.decompress(blob) else { return nil }
-        // walk protobuf: field 5 -> sub { f4=cw, f5=ch, f6=tiles }
         var pos = dec.startIndex
         var cw = 0, ch = 0, ct = 0
         while pos < dec.endIndex {

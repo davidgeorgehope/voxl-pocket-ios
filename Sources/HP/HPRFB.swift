@@ -222,6 +222,21 @@ enum HPRFB {
     /// Like connectThroughServerInit but hands back the live socket so the
     /// caller can continue into the plaintext/enc1103/media-offer negotiation.
     /// Caller owns the socket and must close() it.
+    /// Apple two-TCP warmup (TCP #1): open, exchange the ProtocolVersion banner,
+    /// dwell ~1.4s, drop. Registers the session with screensharingd so the real
+    /// control TCP survives user-context transitions. Best-effort.
+    static func warmupTCP(host: String, port: UInt16, dwell: Double = 1.4) throws {
+        let s = HPSocket()
+        try s.connect(host: host, port: port)
+        defer { s.close() }
+        _ = try s.recvExact(12)
+        try s.send(protocolVersion)
+        let nt = try s.recvExact(1)
+        let count = Int(nt[nt.startIndex])
+        if count > 0 { _ = try? s.recvExact(count) }
+        if dwell > 0 { Thread.sleep(forTimeInterval: dwell) }
+    }
+
     static func connectAndAuth(host: String, port: UInt16,
                                username: String, password: String) throws -> (HPSocket, HandshakeResult) {
         let s = HPSocket()

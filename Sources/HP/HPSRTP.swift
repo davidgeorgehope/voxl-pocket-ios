@@ -185,3 +185,97 @@ struct UInt128 {
         return d
     }
 }
+
+/// SRTCP sender/receiver (AES-256-CTR + HMAC-SHA1-80, RFC 3711 labels 3/4/5).
+/// Protects/unprotects the RTCP feedback (RR/SR/FIR) the client exchanges.
+final class HPSRTCP {
+    private let cipherKey: Data   // label 3, 32
+    private let authKey: Data     // label 4, 20
+    private let salt: [UInt8]     // label 5, 14
+    private let authTagLen = 10
+    private var index: UInt32 = 0
+    private let lock = NSLock()
+
+    init(blob: Data) {
+        let mk = blob.prefix(32)
+        let ms = blob.subdata(in: (blob.startIndex+32)..<(blob.startIndex+46))
+        cipherKey = HPSRTP.kdf(mk, ms, 3, 32)
+        authKey = HPSRTP.kdf(mk, ms, 4, 20)
+        salt = [UInt8](HPSRTP.kdf(mk, ms, 5, 14))
+    }
+
+    private func iv(ssrc: UInt32, index: UInt32) -> Data {
+        var iv = salt + [0, 0]
+        iv[4] ^= UInt8(ssrc >> 24 & 0xff); iv[5] ^= UInt8(ssrc >> 16 & 0xff)
+        iv[6] ^= UInt8(ssrc >> 8 & 0xff);  iv[7] ^= UInt8(ssrc & 0xff)
+        iv[10] ^= UInt8(index >> 24 & 0xff); iv[11] ^= UInt8(index >> 16 & 0xff)
+        iv[12] ^= UInt8(index >> 8 & 0xff);  iv[13] ^= UInt8(index & 0xff)
+        return Data(iv)
+    }
+
+    /// Wrap an RTCP packet (SR/RR/FIR/...) as SRTCP for sending.
+    func protect(_ rtcp: Data) -> Data {
+        lock.lock(); let idx = index; index &+= 1; lock.unlock()
+        let hdr = rtcp.prefix(8)
+        let pt = rtcp.subdata(in: (rtcp.startIndex+8)..<rtcp.endIndex)
+        let ssrc = UInt32(rtcp[rtcp.startIndex+4]) << 24 | UInt32(rtcp[rtcp.startIndex+5]) << 16
+                 | UInt32(rtcp[rtcp.startIndex+6]) << 8 | UInt32(rtcp[rtcp.startIndex+7])
+        let ct = HPSRTP.aesCTR(key: cipherKey, iv: iv(ssrc: ssrc, index: idx), data: pt)
+        let eIndex = Data([UInt8((0x80000000 | idx) >> 24 & 0xff), UInt8(idx >> 16 & 0xff), UInt8(idx >> 8 & 0xff), UInt8(idx & 0xff)])
+        var body = Data(hdr) + ct + eIndex
+        let tag = HPSRTP.hmacSHA1(key: authKey, data: body).prefix(authTagLen)
+        body.append(tag)
+        return body
+    }
+
+    /// Unprotect a received SRTCP packet → plaintext RTCP, or nil.
+    func unprotect(_ pkt: Data) -> Data? {
+        guard pkt.count >= 8 + 4 + authTagLen else { return nil }
+        let body = pkt.prefix(pkt.count - authTagLen)
+        let tag = pkt.suffix(authTagLen)
+        guard HPSRTP.hmacSHA1(key: authKey, data: Data(body)).prefix(authTagLen) == Data(tag) else { return nil }
+        let b = [UInt8](pkt)
+        let eoff = pkt.count - authTagLen - 4
+        let eIndex = UInt32(b[eoff]) << 24 | UInt32(b[eoff+1]) << 16 | UInt32(b[eoff+2]) << 8 | UInt32(b[eoff+3])
+        let encrypted = (eIndex & 0x80000000) != 0
+        let idx = eIndex & 0x7fffffff
+        let hdr = pkt.prefix(8)
+        let ct = pkt.subdata(in: (pkt.startIndex+8)..<(pkt.startIndex + pkt.count - authTagLen - 4))
+        if !encrypted { return Data(hdr) + ct }
+        let ssrc = UInt32(b[4]) << 24 | UInt32(b[5]) << 16 | UInt32(b[6]) << 8 | UInt32(b[7])
+        let ptext = HPSRTP.aesCTR(key: cipherKey, iv: iv(ssrc: ssrc, index: idx), data: ct)
+        return Data(hdr) + ptext
+    }
+}
+
+/// RTCP feedback builders (RFC 3550/4585/5104 + Apple legacy FIR).
+enum HPRTCP {
+    static func be16(_ v: Int) -> [UInt8] { [UInt8(v >> 8 & 0xff), UInt8(v & 0xff)] }
+    static func be32(_ v: UInt32) -> [UInt8] { [UInt8(v >> 24 & 0xff), UInt8(v >> 16 & 0xff), UInt8(v >> 8 & 0xff), UInt8(v & 0xff)] }
+
+    static func emptyRR(_ ssrc: UInt32) -> Data { Data([0x80, 201] + be16(1) + be32(ssrc)) }
+
+    static func rr(sender: UInt32, sources: [UInt32]) -> Data {
+        if sources.isEmpty { return emptyRR(sender) }
+        let rc = min(sources.count, 31)
+        var d = Data([UInt8(0x80 | rc), 201] + be16(1 + rc*6) + be32(sender))
+        for s in sources.prefix(rc) { d += Data(be32(s) + be32(0) + be32(0) + be32(0) + be32(0) + be32(0)) }
+        return d
+    }
+
+    static func emptySR(_ ssrc: UInt32) -> Data {
+        let now = Date().timeIntervalSince1970
+        let ntpSec = UInt32((UInt64(now) + 2208988800) & 0xffffffff)
+        let ntpFrac = UInt32((now - floor(now)) * 4294967296.0) & 0xffffffff
+        let rtpTs = UInt32(UInt64(now * 90000) & 0xffffffff)
+        return Data([0x80, 200] + be16(6) + be32(ssrc) + be32(ntpSec) + be32(ntpFrac) + be32(rtpTs) + be32(0) + be32(0))
+    }
+
+    /// Legacy FIR (RFC 2032, PT=192) — the keyframe request Apple honours best.
+    static func firLegacy(_ target: UInt32) -> Data { Data([0x80, 192] + be16(1) + be32(target)) }
+
+    /// AVPF FIR (RFC 5104, PT=206 FMT 4).
+    static func fir(sender: UInt32, target: UInt32, seq: UInt8) -> Data {
+        Data([UInt8(0x80 | 4), 206] + be16(4) + be32(sender) + be32(0) + be32(target) + [seq, 0, 0, 0])
+    }
+}
