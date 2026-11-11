@@ -17,6 +17,13 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         guard let scene = scene as? UIWindowScene else { return }
         Hosts.seedFromEnvironment()
         let w = UIWindow(windowScene: scene)
+        // HP module self-test harness: launch with VOXL_HP_SELFTEST=1 to run the
+        // offline HP checks and show results on screen (used for Simulator verification).
+        if ProcessInfo.processInfo.environment["VOXL_HP_SELFTEST"] == "1" {
+            w.rootViewController = HPSelfTest.makeView()
+            w.makeKeyAndVisible(); window = w
+            return
+        }
         let nav = UINavigationController(rootViewController: HostPickerViewController())
         w.rootViewController = nav
         w.makeKeyAndVisible()

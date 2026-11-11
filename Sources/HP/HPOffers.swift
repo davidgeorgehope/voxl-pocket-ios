@@ -98,15 +98,20 @@ enum HPOffers {
             start = i; break
         }
         guard start >= 0 else { return nil }
-        // try growing end offsets to find a valid plist
-        var obj: Any?
+        // Grow the end offset until we parse a *dictionary that carries the
+        // media blob* -- a truncated "bplist00" header alone parses into a
+        // non-dict object, so we must keep going past the first success.
+        var dict: [String: Any]?
         var e = start + 8
         while e <= bytes.count {
             let sub = Data(bytes[start..<e])
-            if let o = try? PropertyListSerialization.propertyList(from: sub, options: [], format: nil) { obj = o; break }
-            e += 2
+            if let o = try? PropertyListSerialization.propertyList(from: sub, options: [], format: nil),
+               let d = o as? [String: Any], d["avcMediaStreamNegotiatorMediaBlob"] != nil {
+                dict = d; break
+            }
+            e += 1
         }
-        guard let dict = obj as? [String: Any], let blob = dict["avcMediaStreamNegotiatorMediaBlob"] as? Data,
+        guard let dict, let blob = dict["avcMediaStreamNegotiatorMediaBlob"] as? Data,
               let dec = HPZlib.decompress(blob) else { return nil }
         // walk protobuf: field 5 -> sub { f4=cw, f5=ch, f6=tiles }
         var pos = dec.startIndex
