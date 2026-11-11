@@ -13,6 +13,11 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     private let displayButton = UIButton(type: .system)
     private let densityButton = UIButton(type: .system)
     private let shortcutButton = UIButton(type: .system)
+    private let audioButton = UIButton(type: .system)
+    /// The host can make a virtual display of this screen's size (voxl --virtual-display).
+    private var vdAvailable = false
+    private var lastVd = ""
+    private var lastVdAt = Date.distantPast
 
     private var W: CGFloat = 0, H: CGFloat = 0
     private var resizeScale: Double?
@@ -112,7 +117,10 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
         shortcutButton.showsMenuAsPrimaryAction = true
         styleChrome(shortcutButton)
         updateShortcutMenu()
-        let stack = UIStackView(arrangedSubviews: [backButton, displayButton, densityButton, shortcutButton, kbButton, modeButton])
+        audioButton.addTarget(self, action: #selector(toggleAudio), for: .touchUpInside)
+        styleChrome(audioButton)
+        updateAudioButton()
+        let stack = UIStackView(arrangedSubviews: [backButton, displayButton, densityButton, shortcutButton, audioButton, kbButton, modeButton])
         stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(stack)
@@ -200,9 +208,34 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     // ponytail: fixed display modes; a virtual display at the exact size (as Jump Desktop does) would fill the screen.
     private var density = 0
 
+    /// Ask the host for a virtual display of exactly this screen (or the monitor) when
+    /// it offers one. On by default; persisted.
+    private var useVirtual: Bool {
+        get { UserDefaults.standard.object(forKey: "virtualDisplay") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "virtualDisplay") }
+    }
+
     private func updateDensityMenu() {
         let names = ["Host's resolution (no change)", "Large", "Medium", "More space (pixel perfect)"]
-        densityButton.menu = UIMenu(title: "Text size", children: names.indices.map { i in
+        var items: [UIMenuElement] = []
+        if vdAvailable {
+            items.append(UIAction(title: "Fit this screen (virtual display)", subtitle: "A Mac display at this screen's native size",
+                                  state: useVirtual ? .on : .off) { [weak self] _ in
+                guard let self else { return }
+                self.useVirtual.toggle()
+                if !self.useVirtual { self.session.send("vd,0") }
+                self.lastVd = ""
+                self.updateDensityMenu()
+                self.zoom = 1; self.offset = .zero
+                self.layoutDesk()
+                self.sendResize()
+            })
+            if useVirtual {
+                densityButton.menu = UIMenu(title: "Text size", children: items)
+                return
+            }
+        }
+        densityButton.menu = UIMenu(title: "Text size", children: items + names.indices.map { i in
             UIAction(title: names[i], state: i == density ? .on : .off) { [weak self] _ in
                 guard let self else { return }
                 self.density = i
@@ -289,6 +322,14 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
 
     @objc private func toggleMode() { trackpad.toggle(); updateModeButton() }
 
+    private func updateAudioButton() {
+        let on = session.audioOn
+        audioButton.setImage(UIImage(systemName: on ? "speaker.wave.2.fill" : "speaker.slash.fill"), for: .normal)
+        audioButton.accessibilityLabel = on ? "Mute Mac audio" : "Play Mac audio"
+    }
+
+    @objc private func toggleAudio() { session.audioOn.toggle(); updateAudioButton() }
+
     @objc private func toggleKeyboard() {
         if keyInput.isFirstResponder { keyInput.resignFirstResponder(); becomeFirstResponder() }
         else { keyInput.becomeFirstResponder() }
@@ -315,6 +356,33 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
         layoutDesk()
         placeCursor()
         sendResize()
+    }
+
+    func sessionVirtualDisplay(available: Bool, active: Bool) {
+        let changed = available != vdAvailable
+        vdAvailable = available
+        if changed { updateDensityMenu() }
+        // The host has none (new connection, or it went away): ask again, but not in a
+        // tight loop if the host can't make one.
+        if available, useVirtual, !active, Date().timeIntervalSince(lastVdAt) > 5 { lastVd = "" }
+        sendResize()
+    }
+
+    /// Asks for a virtual display at this screen's native pixels: the monitor's when one
+    /// is connected (HiDPI above 2560 pixels wide, like a 4K panel at "looks like 1080p"),
+    /// otherwise the phone's at 2x. Turning it off sends "vd,0" (back to the Mac's screen).
+    private func sendVirtualDisplay() {
+        let key: String
+        if ExternalDisplay.isActive {
+            guard let px = ExternalDisplay.nativePixels() else { return }
+            key = "\(px.0),\(px.1),\(px.0 > 2560 ? 2 : 1)"
+        } else {
+            guard view.bounds.width > 0, view.bounds.height > 0 else { return }
+            let px = InputMap.nativePixels(widthPoints: view.bounds.width, heightPoints: view.bounds.height, scale: nativeScale)
+            key = "\(px.0),\(px.1),2"
+        }
+        guard key != lastVd else { return }
+        if session.send("vd,\(key)") { lastVd = key; lastVdAt = Date() }
     }
 
     func sessionCursor(_ image: CGImage?, hotspot: CGPoint) {
@@ -430,12 +498,16 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     }
 
     private func scheduleResize() {
-        guard resizeScale != nil else { return }
+        guard resizeScale != nil || vdAvailable else { return }
         resizeTimer?.invalidate()
         resizeTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: false) { [weak self] _ in self?.sendResize() }
     }
 
     private func sendResize() {
+        if vdAvailable && useVirtual {
+            sendVirtualDisplay()
+            return
+        }
         // Mac displays only offer landscape modes; a portrait size makes the host pick a tiny one.
         // ponytail: portrait keeps the current desktop letterboxed; add rotated modes if the host learns them.
         guard let base = resizeScale else { return }

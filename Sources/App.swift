@@ -23,6 +23,15 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         window = w
         // iOS 27+ (looked up at runtime): unique external-display content instead of a mirror.
         _ = VPRegisterExternalSceneAccessory(nav, ExternalSceneDelegate.self)
+        // Testing from a Mac (devicectl launch --environment-variables): VOXL_SELFTEST=1
+        // checks the decoders, VOXL_AUTOCONNECT=<part of a saved URL> opens that host.
+        let env = ProcessInfo.processInfo.environment
+        if env["VOXL_SELFTEST"] == "1" { Diagnostics.displayTest(in: w) }
+        if let want = env["VOXL_AUTOCONNECT"], !want.isEmpty,
+           let host = Hosts.all.first(where: { $0.url.contains(want) }) {
+            Diagnostics.note("autoconnect", host.url)
+            nav.pushViewController(RemoteViewController(host: host), animated: false)
+        }
     }
 }
 

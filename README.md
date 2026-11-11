@@ -5,7 +5,16 @@ desktop server.
 
 ## Features
 
-- H.264 video decoded in hardware (AVSampleBufferDisplayLayer), one layer per stripe
+- H.264 video decoded in hardware (AVSampleBufferDisplayLayer), one layer per stripe.
+  Against a voxl server built with `--hevc` (macOS, VideoToolbox), the app asks for
+  HEVC 4:4:4, then HEVC, then H.264 (`cd,hevc444,hevc,h264`) after checking on launch
+  that the device decodes each in hardware; coloured text keeps full chroma at a
+  fraction of the bitrate. If the 4:4:4 stream can't be shown it falls back to HEVC.
+- Mac audio (the server's Opus stream) played through AVAudioEngine, on by default,
+  with a mute button in the toolbar
+- When the server offers it (`--virtual-display`, experimental), "Fit this screen" in
+  the text-size menu asks for a Mac virtual display at this screen's or the connected
+  monitor's native size
 - Trackpad and touch input, pinch to zoom, two-finger scroll
 - Hardware keyboards and mice, plus the soft keyboard with a key bar for Esc, Tab,
   sticky Shift/Cmd/Ctrl/Opt, ⌘Space, ⌘Tab and arrows
