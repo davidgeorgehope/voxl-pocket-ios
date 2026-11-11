@@ -2,7 +2,13 @@ import UIKit
 import Security
 
 @main
-final class AppDelegate: UIResponder, UIApplicationDelegate {}
+final class AppDelegate: UIResponder, UIApplicationDelegate {
+    func application(_ application: UIApplication,
+                     configurationForConnecting connectingSceneSession: UISceneSession,
+                     options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+        SceneConfiguration.configuration(for: connectingSceneSession)
+    }
+}
 
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     var window: UIWindow?
@@ -11,9 +17,12 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         guard let scene = scene as? UIWindowScene else { return }
         Hosts.seedFromEnvironment()
         let w = UIWindow(windowScene: scene)
-        w.rootViewController = UINavigationController(rootViewController: HostPickerViewController())
+        let nav = UINavigationController(rootViewController: HostPickerViewController())
+        w.rootViewController = nav
         w.makeKeyAndVisible()
         window = w
+        // iOS 27+ (looked up at runtime): unique external-display content instead of a mirror.
+        _ = VPRegisterExternalSceneAccessory(nav, ExternalSceneDelegate.self)
     }
 }
 

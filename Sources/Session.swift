@@ -97,7 +97,7 @@ final class Stripe {
 
 protocol SessionDelegate: AnyObject {
     /// `displays`/`display`: how many displays the host can stream and which one this is.
-    func sessionHello(width: Int, height: Int, stripes: [Stripe], resizeScale: Double?, displays: Int, display: Int)
+    func sessionHello(width: Int, height: Int, stripes: [Stripe], resizeScale: Double?, displays: Int, display: Int, os: String?)
     func sessionCursor(_ image: CGImage?, hotspot: CGPoint)
     func sessionState(_ text: String?)
     /// The host refused the saved password, which is now forgotten.
@@ -267,7 +267,8 @@ final class Session: NSObject, URLSessionWebSocketDelegate {
             let scale = (j["resize"] as? [String: Any])?["scale"] as? Double
             delegate?.sessionState(nil)
             delegate?.sessionHello(width: w, height: h, stripes: stripes, resizeScale: scale,
-                                   displays: j["displays"] as? Int ?? 1, display: j["display"] as? Int ?? 0)
+                                   displays: j["displays"] as? Int ?? 1, display: j["display"] as? Int ?? 0,
+                                   os: j["os"] as? String)
             sendPasteboard() // anything copied on the iPad while disconnected
         case "ping":
             if let v = j["s"] { send("po,\(v)") }

@@ -1,15 +1,18 @@
+import GameController
 import UIKit
 
 /// Full-screen remote desktop: video, cursor, touch/pointer/keyboard input.
-final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRecognizerDelegate, UIPointerInteractionDelegate {
+final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRecognizerDelegate, UIPointerInteractionDelegate, ExternalDisplayDelegate {
     private let session: Session
     private let desk = UIView()            // bounds = desktop pixels, scaled by transform
     private let cursorLayer = CALayer()
     private let status = UILabel()
+    private let monitorHint = UILabel()
     private let keyInput = KeyInput()
     private let modeButton = UIButton(type: .system)
     private let displayButton = UIButton(type: .system)
     private let densityButton = UIButton(type: .system)
+    private let shortcutButton = UIButton(type: .system)
 
     private var W: CGFloat = 0, H: CGFloat = 0
     private var resizeScale: Double?
@@ -33,6 +36,12 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     private var scrollAcc = CGPoint.zero
     private var heldKeys: [Int: Int] = [:] // HID usage -> keysym sent on press
     private var pointerButtons: [ObjectIdentifier: Int] = [:]
+    private var hostOS: String?
+    private var densityBeforeMonitor: Int?
+    private var restoreTouchOnUnplug = false
+    private var repeatTimer: Timer?
+    private var repeatingSym: Int?
+    private var mouseObservers: [NSObjectProtocol] = []
 
     // ponytail: fixed trackpad gain; add acceleration curve if long moves feel slow.
     private let trackpadGain: CGFloat = 1.5
@@ -41,6 +50,7 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     override var prefersHomeIndicatorAutoHidden: Bool { true }
     override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { .all }
     override var canBecomeFirstResponder: Bool { true }
+    override var prefersPointerLocked: Bool { ExternalDisplay.isActive }
 
     init(host: Host) {
         session = Session(host: host)
@@ -66,6 +76,15 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
         status.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(status)
 
+        monitorHint.text = "Desktop is on the monitor\nUse this screen as a trackpad"
+        monitorHint.textColor = UIColor(white: 1, alpha: 0.8)
+        monitorHint.font = .systemFont(ofSize: 17, weight: .medium)
+        monitorHint.textAlignment = .center
+        monitorHint.numberOfLines = 0
+        monitorHint.isHidden = true
+        monitorHint.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(monitorHint)
+
         keyInput.owner = self
         view.addSubview(keyInput)
         kbGuide.isHidden = true
@@ -88,13 +107,22 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
         densityButton.showsMenuAsPrimaryAction = true
         styleChrome(densityButton)
         updateDensityMenu()
-        let stack = UIStackView(arrangedSubviews: [backButton, displayButton, densityButton, kbButton, modeButton])
+        shortcutButton.setImage(UIImage(systemName: "command"), for: .normal)
+        shortcutButton.accessibilityLabel = "Command key"
+        shortcutButton.showsMenuAsPrimaryAction = true
+        styleChrome(shortcutButton)
+        updateShortcutMenu()
+        let stack = UIStackView(arrangedSubviews: [backButton, displayButton, densityButton, shortcutButton, kbButton, modeButton])
         stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(stack)
         NSLayoutConstraint.activate([
             status.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             status.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            monitorHint.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            monitorHint.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            monitorHint.leadingAnchor.constraint(greaterThanOrEqualTo: view.layoutMarginsGuide.leadingAnchor),
+            monitorHint.trailingAnchor.constraint(lessThanOrEqualTo: view.layoutMarginsGuide.trailingAnchor),
             stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
             stack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -12),
             stack.leadingAnchor.constraint(greaterThanOrEqualTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
@@ -106,6 +134,7 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
 
         setupGestures()
         view.addInteraction(UIPointerInteraction(delegate: self))
+        setupMouse()
 
         let nc = NotificationCenter.default
         observers = [
@@ -122,12 +151,19 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
             },
         ]
 
+        ExternalDisplay.delegate = self
         session.delegate = self
         session.start()
+        if let w = ExternalDisplay.window { externalDisplayDidConnect(w) }
     }
 
     private var observers: [NSObjectProtocol] = []
-    deinit { observers.forEach(NotificationCenter.default.removeObserver) }
+    deinit {
+        stopRepeat()
+        if ExternalDisplay.delegate === self { ExternalDisplay.delegate = nil }
+        observers.forEach(NotificationCenter.default.removeObserver)
+        mouseObservers.forEach(NotificationCenter.default.removeObserver)
+    }
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
@@ -139,12 +175,17 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         becomeFirstResponder()
+        ExternalDisplay.delegate = self
+        setNeedsUpdateOfPrefersPointerLocked()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         navigationController?.interactivePopGestureRecognizer?.isEnabled = true
+        stopRepeat()
         releaseAll()
+        if desk.superview !== view { desk.removeFromSuperview() }
+        if ExternalDisplay.delegate === self { ExternalDisplay.delegate = nil }
         session.close()
     }
 
@@ -160,7 +201,7 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     private var density = 0
 
     private func updateDensityMenu() {
-        let names = ["Mac's resolution (no change)", "Large", "Medium", "More space (pixel perfect)"]
+        let names = ["Host's resolution (no change)", "Large", "Medium", "More space (pixel perfect)"]
         densityButton.menu = UIMenu(title: "Text size", children: names.indices.map { i in
             UIAction(title: names[i], state: i == density ? .on : .off) { [weak self] _ in
                 guard let self else { return }
@@ -173,8 +214,30 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
         })
     }
 
+    private var shortcutStyle: InputMap.ShortcutStyle {
+        get { InputMap.ShortcutStyle(rawValue: UserDefaults.standard.integer(forKey: "shortcutStyle")) ?? .auto }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "shortcutStyle") }
+    }
+
+    private var cmdAsCtrl: Bool { InputMap.cmdAsCtrl(style: shortcutStyle, hostOS: hostOS) }
+
+    private func updateShortcutMenu() {
+        let style = shortcutStyle
+        shortcutButton.menu = UIMenu(title: "Command key", children: InputMap.ShortcutStyle.allCases.map { s in
+            UIAction(title: s.title, state: s == style ? .on : .off) { [weak self] _ in
+                self?.shortcutStyle = s
+                self?.updateShortcutMenu()
+            }
+        })
+    }
+
     /// Device pixels per point of this screen (2 on Retina iPads).
     private var nativeScale: CGFloat { view.window?.screen.nativeScale ?? traitCollection.displayScale }
+
+    /// The view that currently shows the desktop (the monitor, when there is one).
+    private var deskHost: UIView { ExternalDisplay.hostView ?? view }
+
+    private var hostScale: CGFloat { ExternalDisplay.isActive ? ExternalDisplay.screenScale : nativeScale }
 
     private func updateDisplayMenu(count: Int, current: Int) {
         displayButton.isHidden = count < 2
@@ -194,8 +257,10 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
         let changed = kb != covered || view.bounds.size != laidOutSize
         covered = kb
         laidOutSize = view.bounds.size
-        layoutDesk()
-        if changed { followCursor() }
+        if !ExternalDisplay.isActive {
+            layoutDesk()
+            if changed { followCursor() }
+        }
         scheduleResize()
     }
 
@@ -234,9 +299,11 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
 
     // MARK: SessionDelegate
 
-    func sessionHello(width: Int, height: Int, stripes: [Stripe], resizeScale: Double?, displays: Int, display: Int) {
+    func sessionHello(width: Int, height: Int, stripes: [Stripe], resizeScale: Double?, displays: Int, display: Int, os: String?) {
         updateDisplayMenu(count: displays, current: display)
         self.display = display
+        self.hostOS = os
+        updateShortcutMenu()
         if ownSize[display] == nil { ownSize[display] = "\(width),\(height)" } // first hello: before we resized it
         W = CGFloat(width); H = CGFloat(height)
         for s in stripes { desk.layer.insertSublayer(s.layer, below: cursorLayer) }
@@ -244,6 +311,7 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
         lastSz = ""
         lastMove = ""
         cursor = CGPoint(x: min(cursor.x, W - 1), y: min(cursor.y, H - 1))
+        attachDesk()
         layoutDesk()
         placeCursor()
         sendResize()
@@ -260,7 +328,67 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
 
     func sessionState(_ text: String?) {
         status.text = text
-        status.isHidden = text == nil
+        // The monitor hint takes the centre of the phone when the desktop is on the monitor.
+        status.isHidden = text == nil || ExternalDisplay.isActive
+    }
+
+    // MARK: external display
+
+    func externalDisplayDidConnect(_ window: UIWindow) {
+        if densityBeforeMonitor == nil { densityBeforeMonitor = density }
+        if density == 0 {
+            density = 3
+            updateDensityMenu()
+        }
+        if !trackpad {
+            restoreTouchOnUnplug = true
+            trackpad = true
+            updateModeButton()
+        }
+        zoom = 1
+        offset = .zero
+        attachDesk()
+        layoutDesk()
+        placeCursor()
+        setNeedsUpdateOfPrefersPointerLocked()
+        sendResize()
+    }
+
+    func externalDisplayDidDisconnect() {
+        if let d = densityBeforeMonitor {
+            density = d
+            densityBeforeMonitor = nil
+            updateDensityMenu()
+        }
+        if restoreTouchOnUnplug {
+            trackpad = false
+            restoreTouchOnUnplug = false
+            updateModeButton()
+        }
+        zoom = 1
+        offset = .zero
+        attachDesk()
+        layoutDesk()
+        placeCursor()
+        followCursor()
+        setNeedsUpdateOfPrefersPointerLocked()
+        lastSz = ""
+        sendResize()
+    }
+
+    func externalDisplayDidLayout(_ window: UIWindow) {
+        layoutDesk()
+        scheduleResize()
+    }
+
+    /// Puts the desktop on the monitor when one is connected, or back on the phone.
+    private func attachDesk() {
+        let host = deskHost
+        if desk.superview !== host { host.insertSubview(desk, at: 0) }
+        monitorHint.isHidden = !ExternalDisplay.isActive
+        if ExternalDisplay.isActive { status.isHidden = true }
+        else if status.text == nil { status.isHidden = true }
+        else { status.isHidden = false }
     }
 
     // MARK: geometry
@@ -270,27 +398,35 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     /// sharp, with a thin border, instead of being scaled a few percent and blurred.
     private var fit: CGFloat {
         guard W > 0, H > 0 else { return 1 }
-        let stretch = min(view.bounds.width / W, view.bounds.height / H)
-        let exact = 1 / nativeScale
+        let b = deskHost.bounds
+        let stretch = min(b.width / W, b.height / H)
+        let exact = 1 / hostScale
         return exact <= stretch && stretch / exact < 1.25 ? exact : stretch
     }
 
-    /// Desktop pixels per on-screen point.
+    /// Desktop pixels per on-screen point of the surface that currently shows the desktop.
     private var deskPerPt: CGFloat { 1 / (fit * zoom) }
+
+    /// Desktop pixels per point of a finger gesture on the phone.
+    private var phonePerPt: CGFloat {
+        ExternalDisplay.isActive ? W / max(view.bounds.width, 1) : deskPerPt
+    }
 
     private func layoutDesk() {
         guard W > 0 else { return }
+        let host = deskHost
         let s = fit * zoom
-        let mx = max(0, (W * s - view.bounds.width) / 2), my = max(0, (H * s - view.bounds.height) / 2)
+        let mx = max(0, (W * s - host.bounds.width) / 2), my = max(0, (H * s - host.bounds.height) / 2)
+        let cover = ExternalDisplay.isActive ? 0 : covered
         offset.x = min(max(offset.x, -mx), mx)
-        offset.y = min(max(offset.y, min(-my, (view.bounds.height - H * s) / 2 - covered)), my) // up to the keyboard's top
+        offset.y = min(max(offset.y, min(-my, (host.bounds.height - H * s) / 2 - cover)), my)
         desk.transform = .identity
         desk.bounds = CGRect(x: 0, y: 0, width: W, height: H)
         desk.transform = CGAffineTransform(scaleX: s, y: s)
         // Put the desktop's corner on a device pixel, or 1:1 still blurs by half a pixel.
-        let n = nativeScale, half = CGSize(width: W * s / 2, height: H * s / 2)
-        desk.center = CGPoint(x: ((view.bounds.midX + offset.x - half.width) * n).rounded() / n + half.width,
-                              y: ((view.bounds.midY + offset.y - half.height) * n).rounded() / n + half.height)
+        let n = hostScale, half = CGSize(width: W * s / 2, height: H * s / 2)
+        desk.center = CGPoint(x: ((host.bounds.midX + offset.x - half.width) * n).rounded() / n + half.width,
+                              y: ((host.bounds.midY + offset.y - half.height) * n).rounded() / n + half.height)
     }
 
     private func scheduleResize() {
@@ -303,6 +439,26 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
         // Mac displays only offer landscape modes; a portrait size makes the host pick a tiny one.
         // ponytail: portrait keeps the current desktop letterboxed; add rotated modes if the host learns them.
         guard let base = resizeScale else { return }
+        if ExternalDisplay.isActive {
+            if density == 0 {
+                if resized.contains(display), let own = ownSize[display], session.send("sz,\(own)") {
+                    lastSz = own
+                    resized.remove(display)
+                }
+                return
+            }
+            guard let win = ExternalDisplay.window, win.bounds.width > 0, win.bounds.height > 0 else { return }
+            let native = Double(ExternalDisplay.screenScale)
+            let scale = [base, (base + native) / 2, native][min(max(density, 1), 3) - 1]
+            let px = InputMap.nativePixels(widthPoints: win.bounds.width, heightPoints: win.bounds.height, scale: scale)
+            let key = "\(px.0),\(px.1)"
+            guard key != lastSz else { return }
+            if session.send("sz,\(key)") {
+                lastSz = key
+                resized.insert(display)
+            }
+            return
+        }
         if density == 0 {
             // Back to the display's own size, only if we changed it. Done only once sent;
             // while disconnected it is retried after the next hello.
@@ -346,9 +502,10 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     private func button(_ b: Int, _ down: Bool) { session.send("b,\(b),\(down ? 1 : 0)") }
     private func click(_ b: Int = 1) { button(b, true); button(b, false) }
 
-    private func scroll(_ dPt: CGPoint) {
-        scrollAcc.x -= dPt.x * deskPerPt
-        scrollAcc.y -= dPt.y * deskPerPt
+    private func scroll(_ dPt: CGPoint, perPoint: CGFloat? = nil) {
+        let k = perPoint ?? phonePerPt
+        scrollAcc.x -= dPt.x * k
+        scrollAcc.y -= dPt.y * k
         guard abs(scrollAcc.x) >= 0.5 || abs(scrollAcc.y) >= 0.5 else { return }
         session.send(String(format: "sp,%.1f,%.1f", scrollAcc.x, scrollAcc.y))
         scrollAcc = .zero
@@ -356,7 +513,7 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
 
     /// Keeps the cursor in sight when zoomed in (trackpad mode) or above the soft keyboard.
     private func followCursor() {
-        guard zoom > 1 || covered > 0, W > 0 else { return }
+        guard !ExternalDisplay.isActive, zoom > 1 || covered > 0, W > 0 else { return }
         let p = view.convert(cursor, from: desk), m: CGFloat = 40
         let b = view.bounds, bottom = b.height - covered - m
         if p.x < m { offset.x += m - p.x } else if p.x > b.width - m { offset.x -= p.x - (b.width - m) }
@@ -401,17 +558,17 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     }
 
     @objc private func tapped1(_ g: UITapGestureRecognizer) {
-        if !trackpad { move(to: toDesk(g.location(in: view))) }
+        if !trackpad, !ExternalDisplay.isActive { move(to: toDesk(g.location(in: view))) }
         click()
     }
 
     @objc private func tapped2(_ g: UITapGestureRecognizer) {
-        if !trackpad { move(to: toDesk(g.location(in: view))) }
+        if !trackpad, !ExternalDisplay.isActive { move(to: toDesk(g.location(in: view))) }
         click(3)
     }
 
     @objc private func longPressed(_ g: UILongPressGestureRecognizer) {
-        if trackpad {
+        if trackpad || ExternalDisplay.isActive {
             // Hold, then drag: left-button drag from the cursor.
             switch g.state {
             case .began: lastLong = g.location(in: view); button(1, true)
@@ -429,14 +586,14 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     }
     private var lastLong = CGPoint.zero
 
-    private func relative(_ d: CGPoint) {
-        let k = trackpadGain * deskPerPt
+    private func relative(_ d: CGPoint, forMouse: Bool = false) {
+        let k: CGFloat = forMouse ? 1 : trackpadGain * phonePerPt
         move(to: CGPoint(x: cursor.x + d.x * k, y: cursor.y + d.y * k))
         followCursor()
     }
 
     @objc private func panned1(_ g: UIPanGestureRecognizer) {
-        if trackpad {
+        if trackpad || ExternalDisplay.isActive {
             relative(g.translation(in: view))
             g.setTranslation(.zero, in: view)
             return
@@ -456,7 +613,7 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     @objc private func panned2(_ g: UIPanGestureRecognizer) {
         let t = g.translation(in: view)
         g.setTranslation(.zero, in: view)
-        if pinching {
+        if pinching, !ExternalDisplay.isActive {
             offset.x += t.x; offset.y += t.y
             layoutDesk()
         } else if g.state == .changed {
@@ -466,6 +623,7 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     }
 
     @objc private func pinched(_ g: UIPinchGestureRecognizer) {
+        if ExternalDisplay.isActive { return }
         switch g.state {
         case .began: pinching = false
         case .changed:
@@ -495,28 +653,34 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     func pointerInteraction(_ i: UIPointerInteraction, styleFor region: UIPointerRegion) -> UIPointerStyle? { .hidden() }
 
     @objc private func hovered(_ g: UIHoverGestureRecognizer) {
+        // On a monitor the pointer is relative (GCMouse / lock); don't jump to a phone coordinate.
+        guard !ExternalDisplay.isActive else { return }
         move(to: toDesk(g.location(in: view)))
     }
 
     @objc private func wheeled(_ g: UIPanGestureRecognizer) {
-        move(to: toDesk(g.location(in: view)))
-        scroll(g.translation(in: view))
+        if !ExternalDisplay.isActive { move(to: toDesk(g.location(in: view))) }
+        scroll(g.translation(in: view), perPoint: ExternalDisplay.isActive ? 1 : deskPerPt)
         g.setTranslation(.zero, in: view)
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         for t in touches where t.type == .indirectPointer {
             let mask = event?.buttonMask ?? .primary
-            let b = mask.contains(.secondary) ? 3 : mask.contains(.button(3)) ? 2 : 1
+            let b = InputMap.pointerButton(primary: mask.contains(.primary),
+                                           secondary: mask.contains(.secondary),
+                                           middle: mask.contains(.button(3)))
             pointerButtons[ObjectIdentifier(t)] = b
-            move(to: toDesk(t.location(in: view)))
+            if !ExternalDisplay.isActive { move(to: toDesk(t.location(in: view))) }
             button(b, true)
         }
         super.touchesBegan(touches, with: event)
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        for t in touches where t.type == .indirectPointer { move(to: toDesk(t.location(in: view))) }
+        if !ExternalDisplay.isActive {
+            for t in touches where t.type == .indirectPointer { move(to: toDesk(t.location(in: view))) }
+        }
         super.touchesMoved(touches, with: event)
     }
 
@@ -533,10 +697,33 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     private func pointerUp(_ touches: Set<UITouch>) {
         for t in touches where t.type == .indirectPointer {
             if let b = pointerButtons.removeValue(forKey: ObjectIdentifier(t)) {
-                move(to: toDesk(t.location(in: view)))
+                if !ExternalDisplay.isActive { move(to: toDesk(t.location(in: view))) }
                 button(b, false)
             }
         }
+    }
+
+    private func setupMouse() {
+        let nc = NotificationCenter.default
+        mouseObservers = [
+            nc.addObserver(forName: .GCMouseDidConnect, object: nil, queue: .main) { [weak self] n in
+                self?.attachMouse(n.object as? GCMouse)
+            },
+            nc.addObserver(forName: .GCMouseDidDisconnect, object: nil, queue: .main) { [weak self] n in
+                (n.object as? GCMouse)?.mouseInput?.mouseMovedHandler = nil
+                self?.setNeedsUpdateOfPrefersPointerLocked()
+            },
+        ]
+        GCMouse.mice().forEach { attachMouse($0) }
+    }
+
+    private func attachMouse(_ mouse: GCMouse?) {
+        guard let input = mouse?.mouseInput else { return }
+        input.mouseMovedHandler = { [weak self] _, dx, dy in
+            guard let self, ExternalDisplay.isActive else { return }
+            self.relative(CGPoint(x: CGFloat(dx), y: CGFloat(dy)), forMouse: true)
+        }
+        setNeedsUpdateOfPrefersPointerLocked()
     }
 
     // MARK: keyboard
@@ -561,10 +748,13 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
             guard let k = p.key else { handled = false; continue }
             let code = k.keyCode.rawValue
             if down {
-                guard let sym = keysym(k) else { continue }
+                guard let raw = keysym(k) else { continue }
+                let sym = InputMap.remap(raw, cmdAsCtrl: cmdAsCtrl)
                 heldKeys[code] = sym
                 key(sym, true)
+                if !InputMap.isModifier(sym) { startRepeat(sym) }
             } else if let sym = heldKeys.removeValue(forKey: code) {
+                if repeatingSym == sym { stopRepeat() }
                 key(sym, false)
             }
         }
@@ -582,16 +772,17 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     /// Sends Cmd+`sym` as one shortcut. If Cmd is already held on a hardware keyboard
     /// (and so already down on the host), only the key is sent.
     func cmdCombo(_ sym: Int) {
-        let cmd = 0xffeb
+        if heldKeys.values.contains(sym) { return } // already delivered via pressesBegan
+        let cmd = InputMap.remap(0xffeb, cmdAsCtrl: cmdAsCtrl)
         let held = heldKeys.values.contains(cmd)
         if !held { key(cmd, true) }
         key(sym, true); key(sym, false)
         if !held { key(cmd, false) }
     }
 
-    /// iPadOS keeps these for itself (Spotlight, app switcher). Asking for priority
-    /// gets some of them to the app; the key bar's buttons work either way.
-    static let systemShortcuts: [UIKeyCommand] = [(" ", 0x20), ("\t", 0xff09)].map { input, sym in
+    /// iPadOS keeps these for itself (Spotlight, app switcher, Hide, Quit, …). Asking
+    /// for priority gets some of them to the app; the key bar's buttons work either way.
+    static let systemShortcuts: [UIKeyCommand] = InputMap.systemShortcutInputs.map { input, sym in
         let c = UIKeyCommand(title: "", action: #selector(RemoteViewController.systemShortcut(_:)),
                              input: input, modifierFlags: .command, propertyList: sym)
         c.wantsPriorityOverSystemBehavior = true
@@ -605,44 +796,52 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     }
 
     func tap(_ sym: Int) {
-        let mods = keyInput.takeModifiers()
+        let mods = keyInput.takeModifiers().map { InputMap.remap($0, cmdAsCtrl: cmdAsCtrl) }
         mods.forEach { key($0, true) }
         key(sym, true); key(sym, false)
         mods.reversed().forEach { key($0, false) }
     }
 
+    private func startRepeat(_ sym: Int) {
+        stopRepeat()
+        repeatingSym = sym
+        let first = Timer(timeInterval: 0.4, repeats: false) { [weak self] _ in
+            self?.fireRepeat()
+            let t = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in self?.fireRepeat() }
+            t.tolerance = 0.01
+            RunLoop.main.add(t, forMode: .common)
+            self?.repeatTimer = t
+        }
+        RunLoop.main.add(first, forMode: .common)
+        repeatTimer = first
+    }
+
+    private func fireRepeat() {
+        guard let sym = repeatingSym else { return stopRepeat() }
+        key(sym, true)
+    }
+
+    private func stopRepeat() {
+        repeatTimer?.invalidate()
+        repeatTimer = nil
+        repeatingSym = nil
+    }
+
     private func releaseAll() {
+        stopRepeat()
         session.send("r")
         heldKeys.removeAll()
         pointerButtons.removeAll()
     }
 
     private func keysym(_ k: UIKey) -> Int? {
-        let code = k.keyCode.rawValue
-        if (0x3A...0x45).contains(code) { return 0xffbe + code - 0x3A } // F1-F12
-        if let s = RemoteViewController.special[k.keyCode] { return s }
-        let mods = k.modifierFlags.intersection([.command, .control, .alternate])
-        let text = mods.isEmpty ? k.characters : k.charactersIgnoringModifiers
-        guard let u = text.unicodeScalars.first else { return nil }
-        return RemoteViewController.keysym(for: u)
+        InputMap.keysym(hid: UInt32(k.keyCode.rawValue),
+                        characters: k.characters,
+                        charactersIgnoringModifiers: k.charactersIgnoringModifiers,
+                        commandControlAlt: !k.modifierFlags.intersection([.command, .control, .alternate]).isEmpty)
     }
 
-    static func keysym(for u: Unicode.Scalar) -> Int {
-        u.value < 0x100 ? Int(u.value) : 0x0100_0000 + Int(u.value)
-    }
-
-    private static let special: [UIKeyboardHIDUsage: Int] = [
-        .keyboardReturnOrEnter: 0xff0d, .keypadEnter: 0xff8d, .keyboardEscape: 0xff1b,
-        .keyboardDeleteOrBackspace: 0xff08, .keyboardTab: 0xff09, .keyboardSpacebar: 0x20,
-        .keyboardDeleteForward: 0xffff, .keyboardHome: 0xff50, .keyboardEnd: 0xff57,
-        .keyboardPageUp: 0xff55, .keyboardPageDown: 0xff56, .keyboardInsert: 0xff63,
-        .keyboardLeftArrow: 0xff51, .keyboardUpArrow: 0xff52, .keyboardRightArrow: 0xff53, .keyboardDownArrow: 0xff54,
-        .keyboardLeftShift: 0xffe1, .keyboardRightShift: 0xffe2,
-        .keyboardLeftControl: 0xffe3, .keyboardRightControl: 0xffe4,
-        .keyboardLeftAlt: 0xffe9, .keyboardRightAlt: 0xffea,
-        .keyboardLeftGUI: 0xffeb, .keyboardRightGUI: 0xffec, // Cmd = Super
-        .keyboardCapsLock: 0xffe5,
-    ]
+    static func keysym(for u: Unicode.Scalar) -> Int { InputMap.keysym(for: u) }
 }
 
 /// Hidden first responder that brings up the soft keyboard and its key toolbar.
