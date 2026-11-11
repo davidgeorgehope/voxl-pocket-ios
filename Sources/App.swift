@@ -34,12 +34,15 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         // checks the decoders, VOXL_AUTOCONNECT=<part of a saved URL> opens that host.
         let env = ProcessInfo.processInfo.environment
         if env["VOXL_SELFTEST"] == "1" { Diagnostics.displayTest(in: w) }
+        // VOXL_SETTINGS=<part of a saved URL> opens that host's settings (screenshots).
+        if let want = env["VOXL_SETTINGS"], !want.isEmpty,
+           let host = Hosts.all.first(where: { $0.url.contains(want) }) {
+            nav.pushViewController(HostSettingsViewController(host: host), animated: false)
+        }
         if let want = env["VOXL_AUTOCONNECT"], !want.isEmpty,
            let host = Hosts.all.first(where: { $0.url.contains(want) }) {
             Diagnostics.note("autoconnect", host.url)
-            let vc: UIViewController = host.url.lowercased().hasPrefix("hpss://")
-                ? HPRemoteViewController(host: host) : RemoteViewController(host: host)
-            nav.pushViewController(vc, animated: false)
+            nav.pushViewController(HostPickerViewController.screen(for: host), animated: false)
         }
     }
 }
@@ -47,6 +50,34 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 struct Host: Codable, Equatable {
     var name: String
     var url: String
+    // High Performance mode: macOS Screen Sharing's HEVC 4:4:4 stream to the same Mac
+    // instead of voxl. Optional so hosts saved by older builds decode unchanged (all off).
+    var hp: Bool? = nil
+    var hpUser: String? = nil
+    var hpPort: Int? = nil
+    var hpMute: Bool? = nil
+    var hpStats: Bool? = nil
+}
+
+extension Host {
+    /// A hand-typed hpss:// URL: Screen Sharing only, no voxl to fall back to.
+    var isHPSS: Bool { url.lowercased().hasPrefix("hpss://") }
+    var usesHP: Bool { isHPSS || (hp ?? false) }
+    var hpHostname: String? { URLComponents(string: url)?.host }
+    var hpPortValue: UInt16 {
+        if isHPSS { return UInt16(URLComponents(string: url)?.port ?? 5900) }
+        return UInt16(clamping: hpPort ?? 5900)
+    }
+    var hpUsername: String {
+        if isHPSS, let u = URLComponents(string: url)?.queryItems?.first(where: { $0.name == "user" })?.value { return u }
+        return hpUser ?? ""
+    }
+    /// Mac audio is muted unless turned on (it would echo when the Mac is in the same room).
+    var hpMuted: Bool { hpMute ?? true }
+    var hpShowStats: Bool { hpStats ?? false }
+    /// The Mac login password lives in the Keychain under its own key; hpss:// hosts
+    /// keep using the URL's key, as before.
+    var hpPasswordKey: String { isHPSS ? url : "hp:" + url }
 }
 
 /// Saved hosts. The list lives in UserDefaults, each host's password in the Keychain
@@ -65,6 +96,31 @@ enum Hosts {
         guard let url = env["VOXL_URL"].flatMap(normalize) else { return }
         if !all.contains(where: { $0.url == url }) { all.append(Host(name: URL(string: url)?.host ?? url, url: url)) }
         if let p = env["VOXL_PASSWORD"], !p.isEmpty { setPassword(p, for: url) }
+        // Test hooks: passwords from 0600 files, read once, deleted, kept in memory only.
+        if let p = takeFile(env["VOXL_PWFILE"]) { memoryPasswords[url] = p }
+        if let p = takeFile(env["VOXL_HP_PWFILE"]) { memoryPasswords[url.lowercased().hasPrefix("hpss://") ? url : "hp:" + url] = p }
+        // VOXL_HP=1/0 sets the saved host's High Performance switch (persists like the UI's Save).
+        if let flag = env["VOXL_HP"], var h = all.first(where: { $0.url == url }) {
+            h.hp = flag == "1"
+            if let u = env["VOXL_HP_USER"] { h.hpUser = u }
+            if let m = env["VOXL_HP_AUDIO_MUTE"] { h.hpMute = m == "1" }
+            if let st = env["VOXL_HP_STATS"] { h.hpStats = st == "1" }
+            if let port = env["VOXL_HP_PORT"] { h.hpPort = Int(port) }
+            update(h)
+        }
+    }
+
+    static func update(_ host: Host) {
+        var list = all
+        if let i = list.firstIndex(where: { $0.url == host.url }) { list[i] = host; all = list }
+    }
+
+    private static var memoryPasswords: [String: String] = [:]
+
+    private static func takeFile(_ path: String?) -> String? {
+        guard let path, let d = FileManager.default.contents(atPath: path) else { return nil }
+        try? FileManager.default.removeItem(atPath: path)
+        return String(data: d, encoding: .utf8)?.trimmingCharacters(in: .newlines)
     }
 
     /// "mac.ts.net:6901" or "https://mac.ts.net" -> "wss://mac.ts.net:6901/ws". Nil if unusable.
@@ -97,8 +153,14 @@ enum Hosts {
 
     static let privacyURL = URL(string: "https://github.com/ericmigi/voxl-pocket-ios#privacy")!
 
-    static func password(for url: String) -> String? { keychain("pw:" + url) }
-    static func setPassword(_ pw: String?, for url: String) { setKeychain("pw:" + url, pw) }
+    static func password(for url: String) -> String? { memoryPasswords[url] ?? keychain("pw:" + url) }
+    static func setPassword(_ pw: String?, for url: String) {
+        if memoryPasswords[url] != nil { memoryPasswords[url] = pw; return }
+        setKeychain("pw:" + url, pw)
+    }
+    /// The Mac login password for High Performance mode.
+    static func hpPassword(for host: Host) -> String? { password(for: host.hpPasswordKey) }
+    static func setHPPassword(_ pw: String?, for host: Host) { setPassword(pw, for: host.hpPasswordKey) }
 
     private static func query(_ account: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
@@ -159,19 +221,35 @@ final class HostPickerViewController: UITableViewController {
     override func tableView(_ t: UITableView, cellForRowAt i: IndexPath) -> UITableViewCell {
         let cell = t.dequeueReusableCell(withIdentifier: "host", for: i)
         var c = UIListContentConfiguration.subtitleCell()
-        c.text = hosts[i.row].name
-        c.secondaryText = hosts[i.row].url
+        let h = hosts[i.row]
+        c.text = h.name
+        c.secondaryText = h.usesHP ? "High Performance · \(h.hpHostname ?? h.url):\(h.hpPortValue)" : h.url
         c.secondaryTextProperties.color = .secondaryLabel
-        c.image = UIImage(systemName: "desktopcomputer")
+        c.image = UIImage(systemName: h.usesHP ? "bolt.horizontal.circle.fill" : "desktopcomputer")
+        c.imageProperties.tintColor = h.usesHP ? .systemOrange : nil
         cell.contentConfiguration = c
-        cell.accessoryType = .disclosureIndicator
+        // (i) opens the host's settings, including the High Performance switch.
+        cell.accessoryType = .detailDisclosureButton
         return cell
+    }
+
+    override func tableView(_ t: UITableView, accessoryButtonTappedForRowWith i: IndexPath) {
+        navigationController?.pushViewController(HostSettingsViewController(host: hosts[i.row]), animated: true)
     }
 
     override func tableView(_ t: UITableView, didSelectRowAt i: IndexPath) {
         t.deselectRow(at: i, animated: true)
         let host = hosts[i.row]
-        if Hosts.password(for: host.url) == nil {
+        if host.usesHP {
+            if host.hpUsername.isEmpty {
+                navigationController?.pushViewController(HostSettingsViewController(
+                    host: host, notice: "High Performance mode needs the Mac's username. Enter it below, or turn the switch off to use voxl."), animated: true)
+            } else if Hosts.hpPassword(for: host) == nil {
+                askPassword(host, hp: true) { [weak self] in self?.connect(host) }
+            } else {
+                connect(host)
+            }
+        } else if Hosts.password(for: host.url) == nil {
             askPassword(host) { [weak self] in self?.connect(host) }
         } else {
             connect(host)
@@ -182,32 +260,37 @@ final class HostPickerViewController: UITableViewController {
         let delete = UIContextualAction(style: .destructive, title: "Delete") { [weak self] _, _, done in
             guard let self else { return done(false) }
             Hosts.setPassword(nil, for: self.hosts[i.row].url)
+            Hosts.setHPPassword(nil, for: self.hosts[i.row])
             self.hosts.remove(at: i.row)
             Hosts.all = self.hosts
             t.deleteRows(at: [i], with: .automatic)
             done(true)
         }
         let edit = UIContextualAction(style: .normal, title: "Edit") { [weak self] _, _, done in
-            self?.edit(i.row)
+            guard let self else { return done(false) }
+            self.navigationController?.pushViewController(HostSettingsViewController(host: self.hosts[i.row]), animated: true)
             done(true)
         }
         return UISwipeActionsConfiguration(actions: [delete, edit])
     }
 
-    private func connect(_ host: Host) {
-        let vc: UIViewController = host.url.lowercased().hasPrefix("hpss://")
-            ? HPRemoteViewController(host: host)
-            : RemoteViewController(host: host)
-        navigationController?.pushViewController(vc, animated: true)
+    /// The High Performance switch picks the client; hpss:// URLs always use it.
+    static func screen(for host: Host) -> UIViewController {
+        host.usesHP ? HPRemoteViewController(host: host) : RemoteViewController(host: host)
     }
 
-    private func askPassword(_ host: Host, then: @escaping () -> Void) {
-        let a = UIAlertController(title: host.name, message: "Password for \(host.url)", preferredStyle: .alert)
+    private func connect(_ host: Host) {
+        navigationController?.pushViewController(Self.screen(for: host), animated: true)
+    }
+
+    private func askPassword(_ host: Host, hp: Bool = false, then: @escaping () -> Void) {
+        let msg = hp ? "Mac login password for \(host.hpUsername) (High Performance mode)" : "Password for \(host.url)"
+        let a = UIAlertController(title: host.name, message: msg, preferredStyle: .alert)
         a.addTextField { $0.isSecureTextEntry = true; $0.placeholder = "Password"; $0.textContentType = .password }
         a.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         a.addAction(UIAlertAction(title: "Connect", style: .default) { [weak a] _ in
             guard let pw = a?.textFields?[0].text, !pw.isEmpty else { return }
-            Hosts.setPassword(pw, for: host.url)
+            if hp { Hosts.setHPPassword(pw, for: host) } else { Hosts.setPassword(pw, for: host.url) }
             then()
         })
         present(a, animated: true)
@@ -238,7 +321,9 @@ final class HostPickerViewController: UITableViewController {
                 return
             }
             let name = (f[0].text ?? "").trimmingCharacters(in: .whitespaces)
-            let host = Host(name: name.isEmpty ? (URL(string: url)?.host ?? url) : name, url: url)
+            var host = old ?? Host(name: "", url: url)
+            host.name = name.isEmpty ? (URL(string: url)?.host ?? url) : name
+            host.url = url
             let pw = f[2].text ?? ""
             if let old, old.url != url {
                 if pw.isEmpty { Hosts.setPassword(Hosts.password(for: old.url), for: url) }

@@ -115,8 +115,19 @@ The harness links the exact same `Sources/HP/*.swift` files the app uses.
    credentials stored in the iOS Keychain (seeded for test from 1Password via
    `op`, vault Grokbot — never committed).
 
+## UI (done)
+
+Each saved connection has a **High Performance mode** switch (host settings, the
+(i) button or swipe > Edit), off by default. On: Mac username, Mac password
+(Keychain, key `hp:<url>`), port (5900), **Mute Mac audio** (default on) and
+**Stats overlay** (default off); both also in the in-session bolt menu, which
+has **Switch to voxl**. Failing to connect (wrong password at once, otherwise
+after two failed attempts or 40 s with no picture) offers "Use voxl", which turns
+the switch off. Bare `hpss://host:port?user=name` addresses still work (always HP,
+no fallback). The virtual-display request (0x1d) is no longer sent (the stream
+works without it; `VOXL_HP_VD=1` brings it back).
+
 ## Branch / merge
 
-On `hp-mode`. Not merged to `main` — the feature is incomplete and another worker
-is changing the voxl path on `main` concurrently; merge only when HP mode is
-functional, rebasing onto their audio/HEVC changes.
+Built on `hp-mode`, which contains `hevc444-audio` (HEVC 4:4:4, Mac audio + mute,
+"Fit this screen"); fast-forwarded into `hevc444-audio` and `main`.

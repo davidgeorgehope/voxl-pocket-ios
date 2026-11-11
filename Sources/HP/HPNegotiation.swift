@@ -83,12 +83,16 @@ enum HPNeg {
                         let canvasW: Int; let canvasH: Int; let tiles: Int
                         let videoSSRC: UInt32; let audioSSRC: UInt32 }
 
+    static var sendVirtualDisplay = ProcessInfo.processInfo.environment["VOXL_HP_VD"] == "1"
+
     /// Full negotiation from a freshly-authed socket (post-ServerInit).
     static func negotiate(_ s: HPSocket, ecbKey: Data, forceAVC: Bool = false) throws -> Negotiated {
         // plaintext phase
         try s.send(viewerInfo() + followup0x12())
         Thread.sleep(forTimeInterval: 0.1)
-        try s.send(virtualDisplay())
+        // The virtual-display request (0x1d) isn't needed: the host streams its real
+        // display without it. Kept behind a flag for experiments.
+        if sendVirtualDisplay { try s.send(virtualDisplay()) }
         try s.send(setEncodings())
 
         // read until enc1103 1103 entry

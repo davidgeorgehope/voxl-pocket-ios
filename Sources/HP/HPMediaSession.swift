@@ -59,6 +59,8 @@ final class HPMediaSession {
     var onFrame: ((CVPixelBuffer, Int, Int) -> Void)?
     var onLog: ((String) -> Void)?
     var onCanvas: ((Int, Int) -> Void)?
+    /// Each failed connection attempt (auth, unreachable, no stream), for the UI.
+    var onError: ((Error) -> Void)?
 
     private let statsLock = NSLock()
     private var _stats = Stats()
@@ -95,7 +97,7 @@ final class HPMediaSession {
         var delay: Double = 1.0
         while running {
             let t0 = Date()
-            do { try runOnce() } catch { log("session error: \(error)") }
+            do { try runOnce() } catch { log("session error: \(error)"); onError?(error) }
             controlSocket?.close(); controlSocket = nil
             if !running { break }
             if Date().timeIntervalSince(t0) > 20 { delay = 1.0 }
@@ -214,8 +216,6 @@ final class HPMediaSession {
         if audioEnabled {
             audioDecoder = HPAudioDecoder()
             if audioDecoder == nil { log("AAC-ELD decoder unavailable") }
-            if audioPlayback && player == nil { player = HPAudioPlayer() }
-            if audioPlayback { player?.start() }
         }
 
         var tcpAlive = true
@@ -490,7 +490,11 @@ final class HPMediaSession {
                 let loud = payload.count > 4 && payload.contains { $0 != 0 }
                 updateStats { $0.audioPackets += 1; if loud { $0.audioNonSilentAUs += 1 } }
                 if let pcm = dec.decode(payload) {
-                    if audioPlayback { player?.play(interleaved: pcm) }
+                    // Mute can flip mid-session; the player starts on first unmuted audio.
+                    if audioPlayback {
+                        if player == nil { player = HPAudioPlayer(); player?.start() }
+                        player?.play(interleaved: pcm)
+                    }
                     let fr = dec.decodedFrames, rms = dec.lastRMS, pk = dec.peakRMS
                     updateStats { $0.audioFrames = fr; $0.audioRMS = rms; $0.audioPeakRMS = pk }
                 }
