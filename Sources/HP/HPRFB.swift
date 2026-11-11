@@ -74,6 +74,15 @@ final class HPSocket {
         return got > 0 ? Data(tmp[0..<got]) : Data()
     }
 
+    /// recv: (bytes, status) with status >0 bytes, 0 on timeout, -1 when closed/error.
+    func recvSomeData(_ n: Int) -> (Data, Int) {
+        var tmp = [UInt8](repeating: 0, count: n)
+        let got = tmp.withUnsafeMutableBytes { Foundation.recv(fd, $0.baseAddress, n, 0) }
+        if got > 0 { return (Data(tmp[0..<got]), got) }
+        if got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { return (Data(), 0) }
+        return (Data(), -1)
+    }
+
     /// recv into a scratch buffer: >0 bytes, 0 on timeout, -1 when closed/error.
     func recvSomeStatus(_ n: Int) -> Int {
         var tmp = [UInt8](repeating: 0, count: n)
@@ -84,6 +93,12 @@ final class HPSocket {
     }
 
     /// Wake any thread blocked in recv on this socket.
+    func setRecvTimeout(_ seconds: Double) {
+        guard fd >= 0 else { return }
+        var tv = timeval(tv_sec: Int(seconds), tv_usec: Int32((seconds - floor(seconds)) * 1_000_000))
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    }
+
     func shutdownBoth() { if fd >= 0 { Darwin.shutdown(fd, SHUT_RDWR) } }
 
     func close() { if fd >= 0 { Darwin.close(fd); fd = -1 } }

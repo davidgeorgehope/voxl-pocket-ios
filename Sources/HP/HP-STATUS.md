@@ -127,6 +127,41 @@ the switch off. Bare `hpss://host:port?user=name` addresses still work (always H
 no fallback). The virtual-display request (0x1d) is no longer sent (the stream
 works without it; `VOXL_HP_VD=1` brings it back).
 
+## Feel / latency / connect (Nov 11 pass)
+
+Measured on the mini (Simulator + macOS harness, 1920x1080 host display):
+
+- **Connect 11.6 s -> 2.9-3.4 s.** The host was never slow: `drainInto` after the
+  encryption toggle did four blocking reads, each waiting for the host's next 2 s
+  heartbeat (7.9 s). It now reads with a 0.3 s timeout. Warmup dwell 1.4 -> 0.5 s
+  (4/4 clean connects). Remaining: warmup 0.5, SRP 0.45 (Release; Debug BigInt is
+  ~8 s), offer answer 0.9, host encoder start ~1.05 s (host side), first frame.
+  The stats overlay shows the timeline ("connect ...").
+- **Pointer.** The host never draws the cursor into the video (it sends shapes via
+  enc 1104 for the client to draw), and taps/pans were absolute with pan = drag.
+  Now: local cursor (host shapes, decoded from 1104; arrow until the first one),
+  trackpad mode by default like voxl (1.5x gain + mild acceleration), tap = click,
+  two-finger tap = right click, hold-drag = drag, two-finger scroll (wheel ticks),
+  pinch zoom; Touch mode in the bolt menu. Pointer events go out on their own queue
+  and coalesce to the newest position (main thread never blocks on the socket).
+  1x1 incremental FBU poll keeps cursor shapes flowing.
+- **Display.** Tiles go straight to one AVSampleBufferDisplayLayer each (stacked
+  stripes); no CPU composite (was a 4K BGRA copy per frame).
+- **Latency.** Marker test (time code drawn on the host, read back from decoded
+  pixels, same clock): host screen -> decoded 10-11 ms in the Simulator (software
+  VT). Screenshot comparison on the same machine: HP shows a 7-13 ms newer frame
+  than voxl. Receive and decode are split (queue depth in stats).
+- **Loss (the Wi-Fi problem).** Generic NACKs are sent at once, but the host never
+  retransmitted HEVC packets (0 recovered across runs with simulated loss), so a
+  picture with a hole is dropped right away (no repair wait). Apple LTR acks are
+  sent for clean tile-0 pictures; a keyframe is asked for only after 150 ms without
+  a clean decode (max 2/s, tile 0). Simulated random loss: 0% -> 0 decode errors;
+  0.5% -> recovers, ~1000 decode errors/20 s; 1-2% -> 1-25 fps, keyframe storms.
+  voxl runs over TCP/WebSocket and never sees loss; HP has no loss resilience
+  beyond keyframes, so on Wi-Fi with any loss it stutters. The overlay shows loss,
+  dropped pictures, decode errors, keyframe requests, HW/SOFTWARE decode and
+  whether the device's hardware decodes HEVC 4:4:4.
+
 ## Branch / merge
 
 Built on `hp-mode`, which contains `hevc444-audio` (HEVC 4:4:4, Mac audio + mute,

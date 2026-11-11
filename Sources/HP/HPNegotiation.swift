@@ -37,6 +37,10 @@ enum HPNeg {
     }
     static func postEncryptionToggle() -> Data { Data([0x12,0x00,0x00,0x02,0x00,0x01,0x00,0x00]) }
 
+    /// 1x1 incremental FramebufferUpdateRequest: keeps the cursor (enc 1104)
+    /// sender armed without pulling video over TCP.
+    static func cursorPoll() -> Data { Data([0x03, 0x01, 0, 0, 0, 0, 0, 1, 0, 1]) }
+
     static func fbuRequest(incremental: Bool) -> Data {
         Data([0x03, incremental ? 1 : 0, 0,0, 0,0, 0xff,0xff, 0xff,0xff])
     }
@@ -81,12 +85,21 @@ enum HPNeg {
     struct Negotiated { let cipher: HPStreamCipher; let videoKeyS: Data; let audioKeyS: Data
                         let videoKeyV: Data; let audioKeyV: Data
                         let canvasW: Int; let canvasH: Int; let tiles: Int
-                        let videoSSRC: UInt32; let audioSSRC: UInt32 }
+                        let videoSSRC: UInt32; let audioSSRC: UInt32
+                        /// Undecrypted tail of the control stream and the messages read
+                        /// alongside the 0x1c answer (often the first cursor pixmap).
+                        var rxTail = Data(); var leftover: [Data] = [] }
+
+    /// Connect-time trace (step name, seconds since negotiate began).
+    static var trace: ((String) -> Void)?
+    static var drainTimeout = Double(ProcessInfo.processInfo.environment["VOXL_HP_DRAIN"] ?? "") ?? 0.3
 
     static var sendVirtualDisplay = ProcessInfo.processInfo.environment["VOXL_HP_VD"] == "1"
 
     /// Full negotiation from a freshly-authed socket (post-ServerInit).
     static func negotiate(_ s: HPSocket, ecbKey: Data, forceAVC: Bool = false) throws -> Negotiated {
+        let t0 = Date()
+        func tr(_ n: String) { trace?(String(format: "neg %@ +%.2fs", n, Date().timeIntervalSince(t0))) }
         // plaintext phase
         try s.send(viewerInfo() + followup0x12())
         Thread.sleep(forTimeInterval: 0.1)
@@ -104,6 +117,7 @@ enum HPNeg {
             init_ += chunk
             if init_.count > 40 { break }
         }
+        tr("enc1103 read")
         guard let cipher = parseEnc1103(init_, ecbKey: ecbKey) else {
             throw HPRFB.RFBError.handshake("server did not advertise enc1103 (rate-limited? retry)")
         }
@@ -114,6 +128,7 @@ enum HPNeg {
         // feed subsequent reads into the same decryptStream call.
         var rx = Data()
         drainInto(&rx, s, cipher)   // advance recv counter past post-toggle traffic
+        tr("post-toggle drained")
 
         // encrypted media offer
         try s.send(cipher.encrypt(setEncodings()))
@@ -124,17 +139,21 @@ enum HPNeg {
         try s.send(cipher.encrypt(msg1c))
         try s.send(cipher.encrypt(fbuRequest(incremental: false)))
 
-        var canvas: (Int, Int, Int)? = readCanvas(&rx, s, cipher)
+        tr("offer sent")
+        var leftover: [Data] = []
+        var canvas: (Int, Int, Int)? = readCanvas(&rx, s, cipher, &leftover)
+        tr("first canvas read")
         var attempts = 0
         while canvas == nil && attempts < 16 {
             Thread.sleep(forTimeInterval: 0.2)
             try s.send(cipher.encrypt(msg1c))
-            canvas = readCanvas(&rx, s, cipher)
+            canvas = readCanvas(&rx, s, cipher, &leftover)
             attempts += 1
         }
+        tr("canvas (attempts \(attempts))")
         let (cw, ch, ct) = canvas ?? (0, 0, 0)
         return Negotiated(cipher: cipher, videoKeyS: vks, audioKeyS: aks, videoKeyV: vkv, audioKeyV: akv, canvasW: cw, canvasH: ch, tiles: ct,
-                          videoSSRC: offers.videoSSRC, audioSSRC: offers.audioSSRC)
+                          videoSSRC: offers.videoSSRC, audioSSRC: offers.audioSSRC, rxTail: rx, leftover: leftover)
     }
 
     private static func randBlob() -> Data {
@@ -185,6 +204,11 @@ enum HPNeg {
     /// Read one batch and advance the cipher recv counter, preserving any
     /// partial-record tail in `rx`.
     private static func drainInto(_ rx: inout Data, _ s: HPSocket, _ cipher: HPStreamCipher) {
+        // Read only what is already queued: each blocking read here used to wait for
+        // the host's next 2 s heartbeat (~8 s of the connect time). A short timeout
+        // still collects the post-toggle burst.
+        s.setRecvTimeout(drainTimeout)
+        defer { s.setRecvTimeout(1.0) }
         for _ in 0..<4 { let c = s.recvSome(65536); if c.isEmpty { break }; rx += c }
         let (_, consumed) = cipher.decryptStream(rx)
         rx.removeSubrange(rx.startIndex..<(rx.startIndex + consumed))
@@ -192,7 +216,7 @@ enum HPNeg {
 
     /// Read into the rolling buffer, decrypt whole records, keep the tail, and
     /// return canvas dims if any decrypted msg carries them.
-    private static func readCanvas(_ rx: inout Data, _ s: HPSocket, _ cipher: HPStreamCipher) -> (Int, Int, Int)? {
+    private static func readCanvas(_ rx: inout Data, _ s: HPSocket, _ cipher: HPStreamCipher, _ leftover: inout [Data]) -> (Int, Int, Int)? {
         for _ in 0..<8 {
             let c = s.recvSome(65536)
             if c.isEmpty { break }
@@ -202,7 +226,10 @@ enum HPNeg {
         guard !rx.isEmpty else { return nil }
         let (msgs, consumed) = cipher.decryptStream(rx)
         rx.removeSubrange(rx.startIndex..<(rx.startIndex + consumed))
-        for m in msgs { if let d = HPOffers.canvasDims(m) { return d } }
-        return nil
+        var found: (Int, Int, Int)?
+        for m in msgs {
+            if found == nil, let d = HPOffers.canvasDims(m) { found = d } else { leftover.append(m) }
+        }
+        return found
     }
 }

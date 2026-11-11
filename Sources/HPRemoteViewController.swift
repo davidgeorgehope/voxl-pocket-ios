@@ -3,28 +3,44 @@ import AVFoundation
 import CoreMedia
 import CoreVideo
 
-/// Screen view for an Apple High-Performance Screen Sharing host (hpss://).
+/// Screen view for an Apple High-Performance Screen Sharing host.
 ///
-/// Drives `HPMediaSession` (RFB+SRP+enc1103 control, SRTP/HEVC-4:4:4 media) and
-/// renders decoded frames through an `AVSampleBufferDisplayLayer`. Touches map
-/// to RFB pointer events; a hidden text field feeds RFB key events. Reuses the
-/// same navigation/full-screen presentation as the WebSocket RemoteViewController
-/// and can be mirrored onto the external-display scene via `displayLayer`.
-final class HPRemoteViewController: UIViewController {
+/// Drives `HPMediaSession` and shows each decoded tile on its own
+/// AVSampleBufferDisplayLayer (stacked stripes, no CPU composite). The pointer is
+/// drawn locally from the host's cursor shapes (enc 1104) and moves the moment a
+/// finger does, like the voxl screen: trackpad mode by default, tap to click,
+/// two-finger tap for a right click, hold then drag to drag, two fingers to scroll,
+/// pinch to zoom.
+final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegate {
     private var host: Host
     private var session: HPMediaSession?
-    private let displayLayer = AVSampleBufferDisplayLayer()
+    private let desk = UIView()                  // canvas-pixel coordinates, scaled to fit
+    private var tileLayers: [Int: AVSampleBufferDisplayLayer] = [:]
+    private var tileDesc: [Int: (CMVideoFormatDescription, Int, Int)] = [:]
+    private let cursorLayer = CALayer()
+    private var cursorImage: CGImage?
+    private var hotspot = CGPoint.zero
     private let statsLabel = UILabel()
     private let statusLabel = UILabel()
     private let menuButton = UIButton(type: .system)
     private let chrome = UIStackView()
-    private var canvasSize = CGSize(width: 1920, height: 1080)
+    private var W: CGFloat = 0, H: CGFloat = 0   // canvas pixels
+    private var cursor = CGPoint(x: 400, y: 300)
     private var buttons: UInt8 = 0
+    private var trackpad = UserDefaults.standard.object(forKey: "hpTrackpad") as? Bool ?? true
+    private var zoom: CGFloat = 1
+    private var offset = CGPoint.zero
+    private var pinching = false
+    private var scrollAcc: CGFloat = 0
+    private var lastLong = CGPoint.zero
     private var statsTimer: Timer?
     private var startedAt = Date()
     private var gotFrame = false
     private var failures = 0
     private var offeredFallback = false
+    private var moves = 0
+    /// voxl's on-device check: does this device's hardware decoder take HEVC 4:4:4?
+    private var device444: Bool?
 
     /// voxl is there to fall back to unless the host is a bare hpss:// address.
     private var canUseVoxl: Bool { !host.isHPSS }
@@ -35,9 +51,14 @@ final class HPRemoteViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
-        displayLayer.videoGravity = .resizeAspect
-        displayLayer.frame = view.bounds
-        view.layer.addSublayer(displayLayer)
+        desk.clipsToBounds = true
+        desk.isUserInteractionEnabled = false
+        view.addSubview(desk)
+        cursorLayer.anchorPoint = .zero
+        cursorLayer.zPosition = 100
+        cursorLayer.actions = ["position": NSNull(), "bounds": NSNull(), "contents": NSNull(), "transform": NSNull()]
+        desk.layer.addSublayer(cursorLayer)
+        setCursor(nil, .zero)
 
         statusLabel.textColor = .white
         statusLabel.font = .preferredFont(forTextStyle: .callout)
@@ -56,7 +77,6 @@ final class HPRemoteViewController: UIViewController {
         statsLabel.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(statsLabel)
 
-        // Same chrome as the voxl screen: round buttons in a row, top right.
         let back = chromeButton("chevron.left")
         back.accessibilityLabel = "Hosts"
         back.addAction(UIAction { [weak self] _ in self?.navigationController?.popViewController(animated: true) }, for: .touchUpInside)
@@ -82,12 +102,7 @@ final class HPRemoteViewController: UIViewController {
             statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: view.layoutMarginsGuide.leadingAnchor),
             statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: view.layoutMarginsGuide.trailingAnchor),
         ])
-
-        let tap = UITapGestureRecognizer(target: self, action: #selector(onTap(_:)))
-        view.addGestureRecognizer(tap)
-        let pan = UIPanGestureRecognizer(target: self, action: #selector(onPan(_:)))
-        view.addGestureRecognizer(pan)
-
+        setupGestures()
         startSession()
     }
 
@@ -99,7 +114,7 @@ final class HPRemoteViewController: UIViewController {
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
-        displayLayer.frame = view.bounds
+        layoutDesk()
     }
 
     private func chromeButton(_ symbol: String) -> UIButton {
@@ -117,12 +132,303 @@ final class HPRemoteViewController: UIViewController {
         NSLayoutConstraint.activate([b.widthAnchor.constraint(equalToConstant: 40), b.heightAnchor.constraint(equalToConstant: 40)])
     }
 
+    // MARK: layout (canvas → screen)
+
+    private var fit: CGFloat { W > 0 ? min(view.bounds.width / W, view.bounds.height / H) : 1 }
+    /// Screen points per canvas pixel right now.
+    private var scale: CGFloat { fit * zoom }
+
+    private func layoutDesk() {
+        guard W > 0 else { return }
+        let s = scale
+        // Keep the zoomed canvas covering the screen where it can.
+        let maxX = max(0, (W * s - view.bounds.width) / 2), maxY = max(0, (H * s - view.bounds.height) / 2)
+        offset.x = min(max(offset.x, -maxX), maxX); offset.y = min(max(offset.y, -maxY), maxY)
+        desk.transform = .identity
+        desk.bounds = CGRect(x: 0, y: 0, width: W, height: H)
+        desk.center = CGPoint(x: view.bounds.midX + offset.x, y: view.bounds.midY + offset.y)
+        desk.transform = CGAffineTransform(scaleX: s, y: s)
+        placeCursor()
+    }
+
+    private func toDesk(_ p: CGPoint) -> CGPoint { desk.convert(p, from: view) }
+
+    // MARK: video (one display layer per tile)
+
+    private func showTile(_ index: Int, _ pb: CVPixelBuffer) {
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
+        var fd = tileDesc[index]
+        if fd == nil || fd!.1 != w || fd!.2 != h {
+            var d: CMVideoFormatDescription?
+            CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pb, formatDescriptionOut: &d)
+            guard let d else { return }
+            fd = (d, w, h); tileDesc[index] = fd
+        }
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()), decodeTimeStamp: .invalid)
+        var sb: CMSampleBuffer?
+        guard CMSampleBufferCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pb, dataReady: true,
+                                                 makeDataReadyCallback: nil, refcon: nil, formatDescription: fd!.0,
+                                                 sampleTiming: &timing, sampleBufferOut: &sb) == noErr, let sb else { return }
+        if let attach = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true) as? [CFMutableDictionary], let a = attach.first {
+            CFDictionarySetValue(a, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(), Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let layer: AVSampleBufferDisplayLayer
+            if let l = self.tileLayers[index] { layer = l } else {
+                layer = AVSampleBufferDisplayLayer()
+                layer.videoGravity = .resize
+                layer.zPosition = CGFloat(index)          // a tile covers the previous one's CTU padding
+                layer.actions = ["position": NSNull(), "bounds": NSNull()]
+                self.desk.layer.insertSublayer(layer, below: self.cursorLayer)
+                self.tileLayers[index] = layer
+            }
+            // Tiles are CTU-padded stripes at index × picture height (as the composite was).
+            let frame = CGRect(x: 0, y: CGFloat(index * h), width: CGFloat(w), height: CGFloat(h))
+            if layer.frame != frame { layer.frame = frame }
+            if layer.status == .failed { layer.flush() }
+            layer.enqueue(sb)
+            if !self.gotFrame {
+                self.gotFrame = true; self.statusLabel.isHidden = true
+                let env = ProcessInfo.processInfo.environment
+                if env["VOXL_HP_POINTER_TEST"] == "1" { self.pointerTest() }
+                // Test hook: put the Mac's pointer at x,y (canvas pixels).
+                if let to = env["VOXL_HP_POINTER_TO"]?.split(separator: ",").compactMap({ Double($0) }), to.count == 2 {
+                    self.move(to: CGPoint(x: to[0], y: to[1]))
+                }
+            }
+        }
+    }
+
+    // MARK: cursor (drawn here, moves with the finger)
+
+    private func setCursor(_ img: CGImage?, _ hot: CGPoint) {
+        cursorImage = img ?? Self.defaultArrow
+        hotspot = img == nil ? CGPoint(x: 2, y: 2) : hot
+        cursorLayer.contents = cursorImage
+        placeCursor()
+    }
+
+    private func placeCursor() {
+        guard let img = cursorImage else { return }
+        // At least ~18 pt tall on screen, else a 4K canvas on a phone shrinks it to a speck.
+        let k = max(1, 18 / (CGFloat(img.height) * max(scale, 0.01)))
+        cursorLayer.bounds = CGRect(x: 0, y: 0, width: CGFloat(img.width) * k, height: CGFloat(img.height) * k)
+        cursorLayer.position = CGPoint(x: cursor.x - hotspot.x * k, y: cursor.y - hotspot.y * k)
+    }
+
+    static let defaultArrow: CGImage? = {
+        let r = UIGraphicsImageRenderer(size: CGSize(width: 24, height: 36), format: { let f = UIGraphicsImageRendererFormat(); f.scale = 1; return f }())
+        return r.image { ctx in
+            let p = UIBezierPath()
+            p.move(to: CGPoint(x: 2, y: 2)); p.addLine(to: CGPoint(x: 2, y: 30)); p.addLine(to: CGPoint(x: 9, y: 24))
+            p.addLine(to: CGPoint(x: 14, y: 34)); p.addLine(to: CGPoint(x: 18, y: 32)); p.addLine(to: CGPoint(x: 13, y: 22))
+            p.addLine(to: CGPoint(x: 22, y: 22)); p.close()
+            UIColor.black.setFill(); p.fill()
+            UIColor.white.setStroke(); p.lineWidth = 1.5; p.stroke()
+        }.cgImage
+    }()
+
+    // MARK: input
+
+    private func setupGestures() {
+        let direct = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        let tap2 = UITapGestureRecognizer(target: self, action: #selector(tapped2)); tap2.numberOfTouchesRequired = 2
+        let tap1 = UITapGestureRecognizer(target: self, action: #selector(tapped1))
+        let long = UILongPressGestureRecognizer(target: self, action: #selector(longPressed)); long.minimumPressDuration = 0.4
+        let pan1 = UIPanGestureRecognizer(target: self, action: #selector(panned1)); pan1.maximumNumberOfTouches = 1
+        let pan2 = UIPanGestureRecognizer(target: self, action: #selector(panned2)); pan2.minimumNumberOfTouches = 2; pan2.maximumNumberOfTouches = 2
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(pinched))
+        for g in [tap1, tap2, long, pan1, pan2, pinch] as [UIGestureRecognizer] {
+            g.allowedTouchTypes = direct
+            g.delegate = self
+            view.addGestureRecognizer(g)
+        }
+        let wheel = UIPanGestureRecognizer(target: self, action: #selector(wheeled))
+        wheel.allowedScrollTypesMask = .all
+        wheel.allowedTouchTypes = []
+        view.addGestureRecognizer(wheel)
+        view.addGestureRecognizer(UIHoverGestureRecognizer(target: self, action: #selector(hovered)))
+    }
+
+    func gestureRecognizer(_ a: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith b: UIGestureRecognizer) -> Bool {
+        let pair = [a, b]
+        return pair.contains { $0 is UIPinchGestureRecognizer } && pair.contains { ($0 as? UIPanGestureRecognizer)?.minimumNumberOfTouches == 2 }
+    }
+
+    /// Moves the local cursor at once and sends the position (coalesced in the session).
+    private func move(to p: CGPoint) {
+        guard W > 0 else { return }
+        cursor = CGPoint(x: min(max(p.x, 0), W - 1), y: min(max(p.y, 0), H - 1))
+        placeCursor()
+        moves += 1
+        session?.movePointer(x: Int(cursor.x.rounded()), y: Int(cursor.y.rounded()), buttons: buttons)
+    }
+
+    private func button(_ mask: UInt8, _ down: Bool) {
+        if down { buttons |= mask } else { buttons &= ~mask }
+        session?.sendPointer(x: Int(cursor.x.rounded()), y: Int(cursor.y.rounded()), buttons: buttons)
+    }
+
+    private func click(_ mask: UInt8 = 1) { button(mask, true); button(mask, false) }
+
+    /// Trackpad motion: 1.5 canvas-points per finger point like voxl, plus a little
+    /// acceleration so a 4K desktop doesn't need several swipes to cross.
+    private func relative(_ d: CGPoint, velocity v: CGPoint) {
+        let speed = hypot(v.x, v.y)
+        let accel = 1 + min(speed / 1200, 1.5)
+        let k = 1.5 * accel / max(scale, 0.01)       // canvas pixels per finger point
+        move(to: CGPoint(x: cursor.x + d.x * k, y: cursor.y + d.y * k))
+        followCursor()
+    }
+
+    private func followCursor() {
+        guard zoom > 1 else { return }
+        let p = view.convert(cursor, from: desk), m: CGFloat = 40, b = view.bounds
+        if p.x < m { offset.x += m - p.x } else if p.x > b.width - m { offset.x -= p.x - (b.width - m) }
+        if p.y < m { offset.y += m - p.y } else if p.y > b.height - m { offset.y -= p.y - (b.height - m) }
+        layoutDesk()
+    }
+
+    @objc private func tapped1(_ g: UITapGestureRecognizer) {
+        if !trackpad { move(to: toDesk(g.location(in: view))) }
+        click(1)
+    }
+
+    @objc private func tapped2(_ g: UITapGestureRecognizer) {
+        if !trackpad { move(to: toDesk(g.location(in: view))) }
+        click(4)                                     // Apple mask: bit 2 = right button
+    }
+
+    @objc private func longPressed(_ g: UILongPressGestureRecognizer) {
+        if trackpad {
+            switch g.state {
+            case .began: lastLong = g.location(in: view); button(1, true)
+            case .changed:
+                let p = g.location(in: view)
+                relative(CGPoint(x: p.x - lastLong.x, y: p.y - lastLong.y), velocity: .zero)
+                lastLong = p
+            case .ended, .cancelled, .failed: button(1, false)
+            default: break
+            }
+        } else if g.state == .began {
+            move(to: toDesk(g.location(in: view)))
+            click(4)
+        }
+    }
+
+    @objc private func panned1(_ g: UIPanGestureRecognizer) {
+        if trackpad {
+            relative(g.translation(in: view), velocity: g.velocity(in: view))
+            g.setTranslation(.zero, in: view)
+            return
+        }
+        switch g.state {
+        case .began:
+            let t = g.translation(in: view), p = g.location(in: view)
+            move(to: toDesk(CGPoint(x: p.x - t.x, y: p.y - t.y)))
+            button(1, true)
+            move(to: toDesk(p))
+        case .changed: move(to: toDesk(g.location(in: view)))
+        case .ended, .cancelled, .failed: button(1, false)
+        default: break
+        }
+    }
+
+    @objc private func panned2(_ g: UIPanGestureRecognizer) {
+        let t = g.translation(in: view)
+        g.setTranslation(.zero, in: view)
+        if pinching {
+            offset.x += t.x; offset.y += t.y
+            layoutDesk()
+        } else if g.state == .changed {
+            scroll(t.y)
+        }
+        if g.state == .ended || g.state == .cancelled { scrollAcc = 0 }
+    }
+
+    /// One wheel tick per ~10 pt of finger travel (natural direction, like a trackpad).
+    private func scroll(_ dy: CGFloat, perTick: CGFloat = 10) {
+        scrollAcc += dy
+        let ticks = Int(scrollAcc / perTick)
+        guard ticks != 0 else { return }
+        scrollAcc -= CGFloat(ticks) * perTick
+        session?.scroll(x: Int(cursor.x), y: Int(cursor.y), ticks: -ticks, buttons: buttons)
+    }
+
+    @objc private func pinched(_ g: UIPinchGestureRecognizer) {
+        switch g.state {
+        case .began: pinching = false
+        case .changed:
+            if !pinching {
+                guard abs(g.scale - 1) > 0.15 else { return }
+                pinching = true
+            }
+            let c = g.location(in: view), anchor = toDesk(c)
+            zoom = min(max(zoom * g.scale, 1), 6)
+            g.scale = 1
+            let s = scale
+            offset = CGPoint(x: c.x - (anchor.x - W / 2) * s - view.bounds.midX,
+                             y: c.y - (anchor.y - H / 2) * s - view.bounds.midY)
+            layoutDesk()
+        default:
+            if pinching, zoom < 1.05 { zoom = 1; offset = .zero; layoutDesk() }
+            pinching = false
+        }
+    }
+
+    @objc private func hovered(_ g: UIHoverGestureRecognizer) { move(to: toDesk(g.location(in: view))) }
+
+    @objc private func wheeled(_ g: UIPanGestureRecognizer) {
+        move(to: toDesk(g.location(in: view)))
+        scroll(g.translation(in: view).y, perTick: 6)
+        g.setTranslation(.zero, in: view)
+    }
+
+    // Magic Keyboard trackpad / mouse buttons.
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for t in touches where t.type == .indirectPointer {
+            move(to: toDesk(t.location(in: view)))
+            button(event?.buttonMask.contains(.secondary) == true ? 4 : 1, true)
+        }
+        super.touchesBegan(touches, with: event)
+    }
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for t in touches where t.type == .indirectPointer { move(to: toDesk(t.location(in: view))) }
+        super.touchesMoved(touches, with: event)
+    }
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        for t in touches where t.type == .indirectPointer { button(5, false) }
+        super.touchesEnded(touches, with: event)
+    }
+
+    /// Test hook: sweep the pointer through the same path a finger drag takes.
+    private func pointerTest() {
+        var i = 0
+        Timer.scheduledTimer(withTimeInterval: 1.0 / 120, repeats: true) { [weak self] t in
+            guard let self else { t.invalidate(); return }
+            i += 1
+            self.relative(CGPoint(x: 2, y: 1), velocity: CGPoint(x: 240, y: 120))
+            if i >= 120 { t.invalidate(); NSLog("[HPLive] pointer test done: cursor %.0f,%.0f", self.cursor.x, self.cursor.y) }
+        }
+    }
+
+    // MARK: menu, fallback
+
     private func updateMenu() {
         var items: [UIMenuElement] = []
         if canUseVoxl {
             items.append(UIAction(title: "Switch to voxl", subtitle: "Turns High Performance mode off for this Mac",
                                   image: UIImage(systemName: "arrow.uturn.backward")) { [weak self] _ in self?.switchToVoxl(reason: nil) })
         }
+        items.append(UIAction(title: "Trackpad mode", subtitle: "Drag anywhere to move the pointer; off = tap where you want",
+                              image: UIImage(systemName: "rectangle.and.hand.point.up.left"),
+                              state: trackpad ? .on : .off) { [weak self] _ in
+            guard let self else { return }
+            self.trackpad.toggle()
+            UserDefaults.standard.set(self.trackpad, forKey: "hpTrackpad")
+            self.updateMenu()
+        })
         items.append(UIAction(title: "Mute Mac audio", image: UIImage(systemName: "speaker.slash"),
                               state: host.hpMuted ? .on : .off) { [weak self] _ in
             guard let self else { return }
@@ -215,9 +521,15 @@ final class HPRemoteViewController: UIViewController {
         // Muted by default: playing the Mac's audio next to the Mac would echo.
         s.audioPlayback = !host.hpMuted
         s.onCanvas = { [weak self] w, h in
-            DispatchQueue.main.async { self?.canvasSize = CGSize(width: max(w,1), height: max(h,1)) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.W = CGFloat(max(w, 1)); self.H = CGFloat(max(h, 1))
+                self.cursor = CGPoint(x: self.W / 2, y: self.H / 2)
+                self.layoutDesk()
+            }
         }
-        s.onFrame = { [weak self] pb, _, _ in self?.enqueue(pb) }
+        s.onTile = { [weak self] i, pb in self?.showTile(i, pb) }
+        s.onCursor = { [weak self] img, hot in DispatchQueue.main.async { self?.setCursor(img, hot) } }
         s.onLog = { line in NSLog("%@", line) }
         s.onError = { [weak self] error in
             let wrong = String(describing: error).contains("auth(")
@@ -228,84 +540,33 @@ final class HPRemoteViewController: UIViewController {
             }
         }
         session = s
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let r = DecoderCheck.result.hevc444
+            DispatchQueue.main.async { self?.device444 = r }
+        }
         startedAt = Date()
         s.start()
         statsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self, let st = self.session?.stats else { return }
-            if st.frames > 0 && !self.gotFrame { self.gotFrame = true; self.statusLabel.isHidden = true }
             if !self.gotFrame, Date().timeIntervalSince(self.startedAt) > 40 {
                 self.failures = max(self.failures, 2)
                 self.failed("Connected, but no picture arrived from the Mac.", wrongPassword: false)
             }
             let ff = st.connectToFirstFrameMs.map { String(format: "%.1fs", $0 / 1000) } ?? "—"
-            let pipe = st.pipelineMs.map { String(format: "%.1f ms", $0) } ?? "—"
-            let text = String(format: "HP %@  %dx%d  %d tiles  %.1f fps\nvideo %.0f pkt/s  %.1f Mbit/s  rx→screen %@  decErr %d\naudio %.0f pkt/s  %@  first frame %@",
-                hostname, st.canvasW, st.canvasH, st.tiles, st.fps,
-                st.videoPPS, st.videoKbps / 1000, pipe, st.decodeErrors, st.audioPPS,
-                (self.session?.audioPlayback ?? false) ? "playing" : "muted", ff)
+            let pipe = st.pipelineMs.map { String(format: "%.0f ms", $0) } ?? "—"
+            let e2e = st.e2eMs.map { String(format: "  screen→decoded %.0f ms", $0) } ?? ""
+            let sent = self.session?.pointerSent ?? 0, coalesced = self.session?.pointerCoalesced ?? 0
+            let dev = self.device444.map { $0 ? "device HW 4:4:4 yes" : "device HW 4:4:4 NO" } ?? ""
+            let text = String(format: "HP %dx%d  %d tiles  %.0f fps  %@ decode  %@\nvideo %.1f Mbit/s  rx→decoded %@%@\nloss %d pkts  dropped %d  decErr %d  keyframe req %d  queue %d\npointer %d moves → %d sent (%d merged)  audio %@\nconnect %@: %@",
+                st.canvasW, st.canvasH, st.tiles, st.updateFPS, st.hwDecode ? "HW" : "SOFTWARE", dev,
+                st.videoKbps / 1000, pipe, e2e,
+                st.lostPackets, st.droppedFrames, st.decodeErrors, st.firs, st.backlogMax,
+                self.moves, sent, coalesced, (self.session?.audioPlayback ?? false) ? "on" : "muted",
+                ff, st.phases)
             self.statsLabel.text = text
-            NSLog("[HPLive] %@ | frames %d bind %@", text.replacingOccurrences(of: "\n", with: " | "), st.frames, st.bindIP)
+            NSLog("[HPLive] %@ | frames %d e2eLast %@ n=%d", text.replacingOccurrences(of: "\n", with: " | "), st.frames,
+                  st.e2eLast.map { String(format: "%.0f", $0) } ?? "-", st.e2eSamples)
         }
-    }
-
-    // MARK: render
-
-    private var fmtDesc: CMVideoFormatDescription?
-    private var lastDims = (0, 0)
-
-    private func enqueue(_ pb: CVPixelBuffer) {
-        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
-        if fmtDesc == nil || lastDims != (w, h) {
-            var fd: CMVideoFormatDescription?
-            CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pb, formatDescriptionOut: &fd)
-            fmtDesc = fd; lastDims = (w, h)
-        }
-        guard let fmtDesc else { return }
-        var timing = CMSampleTimingInfo(duration: .invalid,
-                                        presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()),
-                                        decodeTimeStamp: .invalid)
-        var sb: CMSampleBuffer?
-        let st = CMSampleBufferCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pb,
-                                                    dataReady: true, makeDataReadyCallback: nil, refcon: nil,
-                                                    formatDescription: fmtDesc, sampleTiming: &timing, sampleBufferOut: &sb)
-        guard st == noErr, let sb else { return }
-        if let attach = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: true) as? [CFMutableDictionary], let d = attach.first {
-            CFDictionarySetValue(d, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(), Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
-        }
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            if self.displayLayer.status == .failed { self.displayLayer.flush() }
-            self.displayLayer.enqueue(sb)
-        }
-    }
-
-    // MARK: input (RFB pointer)
-
-    @objc private func onTap(_ g: UITapGestureRecognizer) {
-        let p = canvasPoint(g.location(in: view))
-        session?.sendPointer(x: p.x, y: p.y, buttons: 1)   // button1 down
-        session?.sendPointer(x: p.x, y: p.y, buttons: 0)   // up (click)
-    }
-
-    @objc private func onPan(_ g: UIPanGestureRecognizer) {
-        let p = canvasPoint(g.location(in: view))
-        switch g.state {
-        case .began: buttons = 1
-        case .ended, .cancelled: buttons = 0
-        default: break
-        }
-        session?.sendPointer(x: p.x, y: p.y, buttons: buttons)
-    }
-
-    /// Map a view point to canvas pixels, honouring the aspect-fit letterbox.
-    private func canvasPoint(_ pt: CGPoint) -> (x: Int, y: Int) {
-        let vb = view.bounds.size
-        let scale = min(vb.width / canvasSize.width, vb.height / canvasSize.height)
-        let drawn = CGSize(width: canvasSize.width * scale, height: canvasSize.height * scale)
-        let ox = (vb.width - drawn.width) / 2, oy = (vb.height - drawn.height) / 2
-        let x = (pt.x - ox) / max(scale, 0.0001)
-        let y = (pt.y - oy) / max(scale, 0.0001)
-        return (Int(max(0, min(canvasSize.width - 1, x))), Int(max(0, min(canvasSize.height - 1, y))))
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -313,11 +574,5 @@ final class HPRemoteViewController: UIViewController {
         navigationController?.interactivePopGestureRecognizer?.isEnabled = true
         statsTimer?.invalidate(); statsTimer = nil
         session?.stop(); session = nil
-    }
-
-    /// "hpss://mac.ts.net" or "hpss://mac.ts.net:5900" -> (host, port).
-    static func parseHPSS(_ url: String) -> (String, UInt16)? {
-        guard let c = URLComponents(string: url), c.scheme?.lowercased() == "hpss", let h = c.host, !h.isEmpty else { return nil }
-        return (h, UInt16(c.port ?? 5900))
     }
 }
