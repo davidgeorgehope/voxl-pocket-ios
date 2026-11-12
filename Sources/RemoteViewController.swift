@@ -10,6 +10,7 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     private let monitorHint = UILabel()
     private let keyInput = KeyInput()
     private let modeButton = UIButton(type: .system)
+    private let scrollButton = UIButton(type: .system)
     private let displayButton = UIButton(type: .system)
     private let densityButton = UIButton(type: .system)
     private let shortcutButton = UIButton(type: .system)
@@ -102,6 +103,9 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
         updateModeButton()
         modeButton.addTarget(self, action: #selector(toggleMode), for: .touchUpInside)
         styleChrome(modeButton)
+        scrollButton.showsMenuAsPrimaryAction = true
+        styleChrome(scrollButton)
+        updateScrollMenu()
         displayButton.setImage(UIImage(systemName: "display.2"), for: .normal)
         displayButton.accessibilityLabel = "Display"
         displayButton.showsMenuAsPrimaryAction = true
@@ -120,7 +124,7 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
         audioButton.addTarget(self, action: #selector(toggleAudio), for: .touchUpInside)
         styleChrome(audioButton)
         updateAudioButton()
-        let stack = UIStackView(arrangedSubviews: [backButton, displayButton, densityButton, shortcutButton, audioButton, kbButton, modeButton])
+        let stack = UIStackView(arrangedSubviews: [backButton, displayButton, densityButton, shortcutButton, audioButton, kbButton, scrollButton, modeButton])
         stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(stack)
@@ -321,6 +325,26 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
     }
 
     @objc private func toggleMode() { trackpad.toggle(); updateModeButton() }
+
+    private func updateScrollMenu() {
+        let on = InputMap.naturalScrolling
+        scrollButton.setImage(UIImage(systemName: on ? "arrow.up.and.down" : "arrow.up.and.down.circle"), for: .normal)
+        scrollButton.accessibilityLabel = on ? "Natural scrolling" : "Traditional scrolling"
+        scrollButton.menu = UIMenu(title: "Scrolling", children: [
+            UIAction(title: "Natural scrolling",
+                     subtitle: "Content follows your fingers, like a Mac trackpad",
+                     state: on ? .on : .off) { [weak self] _ in
+                InputMap.naturalScrolling = true
+                self?.updateScrollMenu()
+            },
+            UIAction(title: "Traditional",
+                     subtitle: "Opposite direction, like a scrollbar",
+                     state: on ? .off : .on) { [weak self] _ in
+                InputMap.naturalScrolling = false
+                self?.updateScrollMenu()
+            },
+        ])
+    }
 
     private func updateAudioButton() {
         let on = session.audioOn
@@ -576,8 +600,9 @@ final class RemoteViewController: UIViewController, SessionDelegate, UIGestureRe
 
     private func scroll(_ dPt: CGPoint, perPoint: CGFloat? = nil) {
         let k = perPoint ?? phonePerPt
-        scrollAcc.x -= dPt.x * k
-        scrollAcc.y -= dPt.y * k
+        let d = InputMap.voxlScrollDelta(from: CGPoint(x: dPt.x * k, y: dPt.y * k))
+        scrollAcc.x += d.x
+        scrollAcc.y += d.y
         guard abs(scrollAcc.x) >= 0.5 || abs(scrollAcc.y) >= 0.5 else { return }
         session.send(String(format: "sp,%.1f,%.1f", scrollAcc.x, scrollAcc.y))
         scrollAcc = .zero

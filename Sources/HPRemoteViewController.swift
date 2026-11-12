@@ -2,6 +2,7 @@ import UIKit
 import AVFoundation
 import CoreMedia
 import CoreVideo
+import GameController
 
 /// Screen view for an Apple High-Performance Screen Sharing host.
 ///
@@ -11,7 +12,7 @@ import CoreVideo
 /// finger does, like the voxl screen: trackpad mode by default, tap to click,
 /// two-finger tap for a right click, hold then drag to drag, two fingers to scroll,
 /// pinch to zoom.
-final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegate {
+final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegate, UIPointerInteractionDelegate, ExternalDisplayDelegate {
     private var host: Host
     private var session: HPMediaSession?
     private let desk = UIView()                  // canvas-pixel coordinates, scaled to fit
@@ -22,6 +23,7 @@ final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegat
     private var hotspot = CGPoint.zero
     private let statsLabel = UILabel()
     private let statusLabel = UILabel()
+    private let monitorHint = UILabel()
     private let menuButton = UIButton(type: .system)
     private let chrome = UIStackView()
     private var W: CGFloat = 0, H: CGFloat = 0   // canvas pixels
@@ -39,11 +41,21 @@ final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegat
     private var failures = 0
     private var offeredFallback = false
     private var moves = 0
+    private var restoreTouchOnUnplug = false
+    private var mouseObservers: [NSObjectProtocol] = []
     /// voxl's on-device check: does this device's hardware decoder take HEVC 4:4:4?
     private var device444: Bool?
 
     /// voxl is there to fall back to unless the host is a bare hpss:// address.
     private var canUseVoxl: Bool { !host.isHPSS }
+
+    override var prefersPointerLocked: Bool { ExternalDisplay.isActive }
+
+    /// The view that currently shows the desktop (the monitor, when there is one).
+    private var deskHost: UIView { ExternalDisplay.hostView ?? view }
+
+    /// Trackpad-style input: on by preference, and always while the desktop is on a monitor.
+    private var trackpadSurface: Bool { trackpad || ExternalDisplay.isActive }
 
     init(host: Host) { self.host = host; super.init(nibName: nil, bundle: nil) }
     required init?(coder: NSCoder) { fatalError() }
@@ -67,6 +79,15 @@ final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegat
         statusLabel.text = "Connecting to \(host.name) in High Performance mode…"
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(statusLabel)
+
+        monitorHint.text = "Desktop is on the monitor\nUse this screen as a trackpad"
+        monitorHint.textColor = UIColor(white: 1, alpha: 0.8)
+        monitorHint.font = .systemFont(ofSize: 17, weight: .medium)
+        monitorHint.textAlignment = .center
+        monitorHint.numberOfLines = 0
+        monitorHint.isHidden = true
+        monitorHint.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(monitorHint)
 
         statsLabel.textColor = .systemGreen
         statsLabel.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
@@ -101,9 +122,23 @@ final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegat
             statusLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
             statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: view.layoutMarginsGuide.leadingAnchor),
             statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: view.layoutMarginsGuide.trailingAnchor),
+            monitorHint.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            monitorHint.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            monitorHint.leadingAnchor.constraint(greaterThanOrEqualTo: view.layoutMarginsGuide.leadingAnchor),
+            monitorHint.trailingAnchor.constraint(lessThanOrEqualTo: view.layoutMarginsGuide.trailingAnchor),
         ])
         setupGestures()
+        view.addInteraction(UIPointerInteraction(delegate: self))
+        setupMouse()
+        ExternalDisplay.delegate = self
+        if let w = ExternalDisplay.window { externalDisplayDidConnect(w) }
         startSession()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        ExternalDisplay.delegate = self
+        setNeedsUpdateOfPrefersPointerLocked()
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -134,24 +169,82 @@ final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegat
 
     // MARK: layout (canvas → screen)
 
-    private var fit: CGFloat { W > 0 ? min(view.bounds.width / W, view.bounds.height / H) : 1 }
+    private var fit: CGFloat {
+        guard W > 0, H > 0 else { return 1 }
+        let b = deskHost.bounds
+        return min(b.width / W, b.height / H)
+    }
     /// Screen points per canvas pixel right now.
     private var scale: CGFloat { fit * zoom }
 
     private func layoutDesk() {
         guard W > 0 else { return }
+        let host = deskHost
         let s = scale
-        // Keep the zoomed canvas covering the screen where it can.
-        let maxX = max(0, (W * s - view.bounds.width) / 2), maxY = max(0, (H * s - view.bounds.height) / 2)
+        // Keep the zoomed canvas covering the surface where it can. On a monitor
+        // at zoom 1 this fills the panel (letterboxed if the aspect ratios differ).
+        let maxX = max(0, (W * s - host.bounds.width) / 2), maxY = max(0, (H * s - host.bounds.height) / 2)
+        if ExternalDisplay.isActive, zoom <= 1 { offset = .zero }
         offset.x = min(max(offset.x, -maxX), maxX); offset.y = min(max(offset.y, -maxY), maxY)
         desk.transform = .identity
         desk.bounds = CGRect(x: 0, y: 0, width: W, height: H)
-        desk.center = CGPoint(x: view.bounds.midX + offset.x, y: view.bounds.midY + offset.y)
+        let n = ExternalDisplay.isActive ? ExternalDisplay.screenScale : (view.window?.screen.nativeScale ?? traitCollection.displayScale)
+        let half = CGSize(width: W * s / 2, height: H * s / 2)
+        desk.center = CGPoint(x: ((host.bounds.midX + offset.x - half.width) * n).rounded() / n + half.width,
+                              y: ((host.bounds.midY + offset.y - half.height) * n).rounded() / n + half.height)
         desk.transform = CGAffineTransform(scaleX: s, y: s)
         placeCursor()
     }
 
     private func toDesk(_ p: CGPoint) -> CGPoint { desk.convert(p, from: view) }
+
+    /// Puts the desktop on the monitor when one is connected, or back on the phone.
+    private func attachDesk() {
+        let host = deskHost
+        if desk.superview !== host { host.insertSubview(desk, at: 0) }
+        monitorHint.isHidden = !ExternalDisplay.isActive
+        // The monitor hint takes the centre of the phone; errors still appear as alerts.
+        if ExternalDisplay.isActive {
+            statusLabel.isHidden = true
+        } else if statusLabel.text == nil || statusLabel.text?.isEmpty == true {
+            statusLabel.isHidden = true
+        } else {
+            statusLabel.isHidden = false
+        }
+    }
+
+    func externalDisplayDidConnect(_ window: UIWindow) {
+        if !trackpad {
+            restoreTouchOnUnplug = true
+            trackpad = true
+            updateMenu()
+        }
+        zoom = 1
+        offset = .zero
+        attachDesk()
+        layoutDesk()
+        placeCursor()
+        setNeedsUpdateOfPrefersPointerLocked()
+    }
+
+    func externalDisplayDidDisconnect() {
+        if restoreTouchOnUnplug {
+            trackpad = false
+            restoreTouchOnUnplug = false
+            updateMenu()
+        }
+        zoom = 1
+        offset = .zero
+        attachDesk()
+        layoutDesk()
+        placeCursor()
+        followCursor()
+        setNeedsUpdateOfPrefersPointerLocked()
+    }
+
+    func externalDisplayDidLayout(_ window: UIWindow) {
+        layoutDesk()
+    }
 
     // MARK: video (one display layer per tile)
 
@@ -283,7 +376,7 @@ final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegat
     }
 
     private func followCursor() {
-        guard zoom > 1 else { return }
+        guard !ExternalDisplay.isActive, zoom > 1 else { return }
         let p = view.convert(cursor, from: desk), m: CGFloat = 40, b = view.bounds
         if p.x < m { offset.x += m - p.x } else if p.x > b.width - m { offset.x -= p.x - (b.width - m) }
         if p.y < m { offset.y += m - p.y } else if p.y > b.height - m { offset.y -= p.y - (b.height - m) }
@@ -291,17 +384,17 @@ final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegat
     }
 
     @objc private func tapped1(_ g: UITapGestureRecognizer) {
-        if !trackpad { move(to: toDesk(g.location(in: view))) }
+        if !trackpadSurface { move(to: toDesk(g.location(in: view))) }
         click(1)
     }
 
     @objc private func tapped2(_ g: UITapGestureRecognizer) {
-        if !trackpad { move(to: toDesk(g.location(in: view))) }
+        if !trackpadSurface { move(to: toDesk(g.location(in: view))) }
         click(4)                                     // Apple mask: bit 2 = right button
     }
 
     @objc private func longPressed(_ g: UILongPressGestureRecognizer) {
-        if trackpad {
+        if trackpadSurface {
             switch g.state {
             case .began: lastLong = g.location(in: view); button(1, true)
             case .changed:
@@ -318,7 +411,7 @@ final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegat
     }
 
     @objc private func panned1(_ g: UIPanGestureRecognizer) {
-        if trackpad {
+        if trackpadSurface {
             relative(g.translation(in: view), velocity: g.velocity(in: view))
             g.setTranslation(.zero, in: view)
             return
@@ -338,7 +431,7 @@ final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegat
     @objc private func panned2(_ g: UIPanGestureRecognizer) {
         let t = g.translation(in: view)
         g.setTranslation(.zero, in: view)
-        if pinching {
+        if pinching, !ExternalDisplay.isActive {
             offset.x += t.x; offset.y += t.y
             layoutDesk()
         } else if g.state == .changed {
@@ -347,16 +440,15 @@ final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegat
         if g.state == .ended || g.state == .cancelled { scrollAcc = 0 }
     }
 
-    /// One wheel tick per ~10 pt of finger travel (natural direction, like a trackpad).
+    /// One wheel tick per ~10 pt of finger travel. Direction follows InputMap.naturalScrolling.
     private func scroll(_ dy: CGFloat, perTick: CGFloat = 10) {
-        scrollAcc += dy
-        let ticks = Int(scrollAcc / perTick)
+        let ticks = InputMap.hpScrollTicks(translationY: dy, accumulated: &scrollAcc, perTick: perTick)
         guard ticks != 0 else { return }
-        scrollAcc -= CGFloat(ticks) * perTick
-        session?.scroll(x: Int(cursor.x), y: Int(cursor.y), ticks: -ticks, buttons: buttons)
+        session?.scroll(x: Int(cursor.x), y: Int(cursor.y), ticks: ticks, buttons: buttons)
     }
 
     @objc private func pinched(_ g: UIPinchGestureRecognizer) {
+        if ExternalDisplay.isActive { return }
         switch g.state {
         case .began: pinching = false
         case .changed:
@@ -377,10 +469,15 @@ final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegat
         }
     }
 
-    @objc private func hovered(_ g: UIHoverGestureRecognizer) { move(to: toDesk(g.location(in: view))) }
+    func pointerInteraction(_ i: UIPointerInteraction, styleFor region: UIPointerRegion) -> UIPointerStyle? { .hidden() }
+
+    @objc private func hovered(_ g: UIHoverGestureRecognizer) {
+        guard !ExternalDisplay.isActive else { return }
+        move(to: toDesk(g.location(in: view)))
+    }
 
     @objc private func wheeled(_ g: UIPanGestureRecognizer) {
-        move(to: toDesk(g.location(in: view)))
+        if !ExternalDisplay.isActive { move(to: toDesk(g.location(in: view))) }
         scroll(g.translation(in: view).y, perTick: 6)
         g.setTranslation(.zero, in: view)
     }
@@ -388,13 +485,15 @@ final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegat
     // Magic Keyboard trackpad / mouse buttons.
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         for t in touches where t.type == .indirectPointer {
-            move(to: toDesk(t.location(in: view)))
+            if !ExternalDisplay.isActive { move(to: toDesk(t.location(in: view))) }
             button(event?.buttonMask.contains(.secondary) == true ? 4 : 1, true)
         }
         super.touchesBegan(touches, with: event)
     }
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        for t in touches where t.type == .indirectPointer { move(to: toDesk(t.location(in: view))) }
+        if !ExternalDisplay.isActive {
+            for t in touches where t.type == .indirectPointer { move(to: toDesk(t.location(in: view))) }
+        }
         super.touchesMoved(touches, with: event)
     }
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -428,6 +527,13 @@ final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegat
             self.trackpad.toggle()
             UserDefaults.standard.set(self.trackpad, forKey: "hpTrackpad")
             self.updateMenu()
+        })
+        items.append(UIAction(title: "Natural scrolling",
+                              subtitle: "Content follows your fingers, like a Mac trackpad",
+                              image: UIImage(systemName: "arrow.up.and.down"),
+                              state: InputMap.naturalScrolling ? .on : .off) { [weak self] _ in
+            InputMap.naturalScrolling.toggle()
+            self?.updateMenu()
         })
         items.append(UIAction(title: "Mute Mac audio", image: UIImage(systemName: "speaker.slash"),
                               state: host.hpMuted ? .on : .off) { [weak self] _ in
@@ -513,6 +619,10 @@ final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegat
     }
 
     private func startSession() {
+        if ProcessInfo.processInfo.environment["VOXL_HP_FAKE_DESK"] == "1" {
+            installFakeDesk()
+            return
+        }
         guard let hostname = host.hpHostname, !hostname.isEmpty else {
             statusLabel.text = "This Mac's address has no host name."; return
         }
@@ -525,6 +635,7 @@ final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegat
                 guard let self else { return }
                 self.W = CGFloat(max(w, 1)); self.H = CGFloat(max(h, 1))
                 self.cursor = CGPoint(x: self.W / 2, y: self.H / 2)
+                self.attachDesk()
                 self.layoutDesk()
             }
         }
@@ -569,10 +680,108 @@ final class HPRemoteViewController: UIViewController, UIGestureRecognizerDelegat
         }
     }
 
+    /// Simulator / screenshot hook: a labelled 1920×1080 canvas, same attach/layout path as a live stream.
+    private func installFakeDesk() {
+        W = 1920
+        H = 1080
+        cursor = CGPoint(x: W / 2, y: H / 2)
+        desk.viewWithTag(0x48504644)?.removeFromSuperview() // "HPFD"
+        let canvas = FakeHPDesktopView(frame: CGRect(x: 0, y: 0, width: W, height: H))
+        canvas.tag = 0x48504644
+        canvas.autoresizingMask = []
+        desk.insertSubview(canvas, at: 0)
+        statusLabel.text = "High Performance (test desktop)"
+        attachDesk()
+        layoutDesk()
+        placeCursor()
+        NSLog("[HPLive] fake desk %gx%g on %@", W, H, ExternalDisplay.isActive ? "external display" : "phone")
+    }
+
+    private func setupMouse() {
+        let nc = NotificationCenter.default
+        mouseObservers = [
+            nc.addObserver(forName: .GCMouseDidConnect, object: nil, queue: .main) { [weak self] n in
+                self?.attachMouse(n.object as? GCMouse)
+            },
+            nc.addObserver(forName: .GCMouseDidDisconnect, object: nil, queue: .main) { [weak self] n in
+                (n.object as? GCMouse)?.mouseInput?.mouseMovedHandler = nil
+                self?.setNeedsUpdateOfPrefersPointerLocked()
+            },
+        ]
+        GCMouse.mice().forEach { attachMouse($0) }
+    }
+
+    private func attachMouse(_ mouse: GCMouse?) {
+        guard let input = mouse?.mouseInput else { return }
+        input.mouseMovedHandler = { [weak self] _, dx, dy in
+            guard let self, ExternalDisplay.isActive else { return }
+            self.relative(CGPoint(x: CGFloat(dx), y: CGFloat(dy)), velocity: .zero)
+        }
+        setNeedsUpdateOfPrefersPointerLocked()
+    }
+
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         navigationController?.interactivePopGestureRecognizer?.isEnabled = true
+        if desk.superview !== view { desk.removeFromSuperview() }
+        if ExternalDisplay.delegate === self { ExternalDisplay.delegate = nil }
         statsTimer?.invalidate(); statsTimer = nil
         session?.stop(); session = nil
+    }
+
+    deinit {
+        if ExternalDisplay.delegate === self { ExternalDisplay.delegate = nil }
+        mouseObservers.forEach(NotificationCenter.default.removeObserver)
+    }
+}
+
+/// Coloured 1920×1080 panel used when VOXL_HP_FAKE_DESK=1, so Simulator screenshots
+/// can show the desktop on an attached external display without a live HP stream.
+private final class FakeHPDesktopView: UIView {
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        backgroundColor = UIColor(red: 0.07, green: 0.18, blue: 0.38, alpha: 1)
+        let title = UILabel()
+        title.text = "High Performance desktop"
+        title.textColor = .white
+        title.font = .systemFont(ofSize: 72, weight: .semibold)
+        title.textAlignment = .center
+        title.translatesAutoresizingMaskIntoConstraints = false
+        let sub = UILabel()
+        sub.text = "1920 × 1080  ·  fills this monitor"
+        sub.textColor = UIColor(white: 1, alpha: 0.8)
+        sub.font = .systemFont(ofSize: 36, weight: .medium)
+        sub.textAlignment = .center
+        sub.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(title)
+        addSubview(sub)
+        NSLayoutConstraint.activate([
+            title.centerXAnchor.constraint(equalTo: centerXAnchor),
+            title.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -40),
+            sub.centerXAnchor.constraint(equalTo: centerXAnchor),
+            sub.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 16),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func draw(_ rect: CGRect) {
+        super.draw(rect)
+        guard let c = UIGraphicsGetCurrentContext() else { return }
+        c.setStrokeColor(UIColor(white: 1, alpha: 0.12).cgColor)
+        c.setLineWidth(2)
+        let step: CGFloat = 120
+        var x: CGFloat = 0
+        while x <= bounds.width {
+            c.move(to: CGPoint(x: x, y: 0)); c.addLine(to: CGPoint(x: x, y: bounds.height)); x += step
+        }
+        var y: CGFloat = 0
+        while y <= bounds.height {
+            c.move(to: CGPoint(x: 0, y: y)); c.addLine(to: CGPoint(x: bounds.width, y: y)); y += step
+        }
+        c.strokePath()
+        c.setStrokeColor(UIColor.systemOrange.cgColor)
+        c.setLineWidth(16)
+        c.stroke(bounds.insetBy(dx: 8, dy: 8))
     }
 }

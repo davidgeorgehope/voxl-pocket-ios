@@ -16,13 +16,15 @@ final class HostSettingsViewController: UITableViewController, UITextFieldDelega
     private let hpSwitch = UISwitch()
     private let muteSwitch = UISwitch()
     private let statsSwitch = UISwitch()
+    private let naturalSwitch = UISwitch()
 
-    private enum Row { case name, url, password, hp, user, hpPassword, port, mute, stats }
+    private enum Row { case name, url, password, hp, user, hpPassword, port, mute, stats, natural }
     private var sections: [[Row]] {
         var hpRows: [Row] = [.hp]
         if hpSwitch.isOn { hpRows += [.user, .hpPassword, .port] }
         var out: [[Row]] = [[.name, .url, .password], hpRows]
         if hpSwitch.isOn { out.append([.mute, .stats]) }
+        out.append([.natural])
         return out
     }
 
@@ -49,6 +51,12 @@ final class HostSettingsViewController: UITableViewController, UITextFieldDelega
         hpSwitch.addAction(UIAction { [weak self] _ in self?.tableView.reloadData() }, for: .valueChanged)
         muteSwitch.isOn = host.hpMuted
         statsSwitch.isOn = host.hpShowStats
+        naturalSwitch.isOn = InputMap.naturalScrolling
+        naturalSwitch.accessibilityIdentifier = "naturalScrolling"
+        naturalSwitch.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            InputMap.naturalScrolling = self.naturalSwitch.isOn
+        }, for: .valueChanged)
         if host.isHPSS { userField.isEnabled = false; portField.isEnabled = false }
         tableView.register(UITableViewCell.self, forCellReuseIdentifier: "row")
     }
@@ -75,19 +83,28 @@ final class HostSettingsViewController: UITableViewController, UITextFieldDelega
     override func tableView(_ t: UITableView, numberOfRowsInSection s: Int) -> Int { sections[s].count }
 
     override func tableView(_ t: UITableView, titleForHeaderInSection s: Int) -> String? {
-        ["voxl", "High Performance mode", "High Performance options"][s]
+        switch sections[s].first {
+        case .name: return "voxl"
+        case .hp: return "High Performance mode"
+        case .mute: return "High Performance options"
+        case .natural: return "On this iPhone"
+        default: return nil
+        }
     }
 
     override func tableView(_ t: UITableView, titleForFooterInSection s: Int) -> String? {
-        switch s {
-        case 0: return nil
-        case 1:
+        switch sections[s].first {
+        case .hp:
             if host.isHPSS { return "This is an hpss:// address, so it always uses High Performance mode. Add the Mac's voxl address instead to be able to switch." }
             return hpSwitch.isOn
                 ? "Uses macOS Screen Sharing (High Performance: HEVC 4:4:4, up to 4K) on the same Mac instead of voxl. Turn on Screen Sharing on the Mac and sign in with your Mac account. If it fails you can switch back to voxl from the session."
                 : "Off: the normal voxl client. On: macOS Screen Sharing's High Performance mode to the same Mac."
-        default:
+        case .mute:
             return "Mac audio stays muted unless you turn it on, so it doesn't echo when you're next to the Mac."
+        case .natural:
+            return "Natural scrolling matches a Mac trackpad: content follows your fingers. This applies in both voxl and High Performance mode. You can also change it from the session toolbar."
+        default:
+            return nil
         }
     }
 
@@ -143,6 +160,7 @@ final class HostSettingsViewController: UITableViewController, UITextFieldDelega
         case .port: field("Port", portField)
         case .mute: toggle("Mute Mac audio", nil, muteSwitch)
         case .stats: toggle("Stats overlay", "fps, bitrate, latency", statsSwitch)
+        case .natural: toggle("Natural scrolling", "Like a Mac trackpad", naturalSwitch)
         }
         return cell
     }

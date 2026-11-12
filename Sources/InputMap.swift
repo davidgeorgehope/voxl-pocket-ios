@@ -106,4 +106,45 @@ enum InputMap {
         0xE3: 0xffeb, 0xE7: 0xffec, // GUI / Command
         0x39: 0xffe5, // Caps Lock
     ]
+
+
+    // MARK: scroll direction
+
+    /// UserDefaults key for macOS-style natural scrolling (content follows the fingers).
+    static let naturalScrollingKey = "naturalScrolling"
+
+    /// Default on, like a Mac trackpad. Off is traditional (scrollbar / wheel) direction.
+    static var naturalScrolling: Bool {
+        get {
+            let d = UserDefaults.standard
+            return d.object(forKey: naturalScrollingKey) as? Bool ?? true
+        }
+        set { UserDefaults.standard.set(newValue, forKey: naturalScrollingKey) }
+    }
+
+    /// voxl `sp` delta from a UIKit translation (points, y-down).
+    ///
+    /// The host treats positive dy as "scroll down" (see voxl InputEvent::Scroll).
+    /// Natural: finger up (negative y) sends a positive `sp` dy, which the macOS
+    /// host then turns into content moving up — same as a Mac trackpad.
+    /// Traditional inverts that.
+    static func voxlScrollDelta(from translation: CGPoint) -> CGPoint {
+        let s: CGFloat = naturalScrolling ? -1 : 1
+        return CGPoint(x: translation.x * s, y: translation.y * s)
+    }
+
+    /// Accumulate a UIKit translation into RFB wheel ticks for High Performance mode.
+    ///
+    /// `HPMediaSession.scroll` maps negative ticks to button 4 (scroll up) and
+    /// positive ticks to button 5 (scroll down). Natural: finger up (negative y)
+    /// yields negative ticks so a Mac with natural scrolling moves content up.
+    /// Traditional keeps the previous inverted mapping.
+    static func hpScrollTicks(translationY dy: CGFloat, accumulated: inout CGFloat, perTick: CGFloat) -> Int {
+        guard perTick > 0 else { return 0 }
+        accumulated += dy
+        let raw = Int(accumulated / perTick)
+        guard raw != 0 else { return 0 }
+        accumulated -= CGFloat(raw) * perTick
+        return naturalScrolling ? raw : -raw
+    }
 }

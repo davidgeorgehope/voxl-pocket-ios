@@ -43,6 +43,10 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
            let host = Hosts.all.first(where: { $0.url.contains(want) }) {
             Diagnostics.note("autoconnect", host.url)
             nav.pushViewController(HostPickerViewController.screen(for: host), animated: false)
+        } else if env["VOXL_HP_FAKE_DESK"] == "1" {
+            // Simulator hook: HP session with a labelled canvas, no live Screen Sharing.
+            let host = Hosts.all.first(where: { $0.usesHP }) ?? Host(name: "HP test", url: "hpss://test.local", hp: true)
+            nav.pushViewController(HPRemoteViewController(host: host), animated: false)
         }
     }
 }

@@ -10,7 +10,7 @@ settings:
     SWIFT_VERSION: "5.0"
     TARGETED_DEVICE_FAMILY: "1,2"
     MARKETING_VERSION: "0.2"
-    CURRENT_PROJECT_VERSION: "2"
+    CURRENT_PROJECT_VERSION: "3"
 packages:
   BigInt:
     url: https://github.com/attaswift/BigInt.git
@@ -32,6 +32,8 @@ targets:
     info:
       path: Sources/Info.plist
       properties:
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         CFBundleDisplayName: Voxl Pocket
         ITSAppUsesNonExemptEncryption: false
         NSAppTransportSecurity:

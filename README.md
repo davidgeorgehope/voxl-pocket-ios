@@ -15,13 +15,14 @@ desktop server.
 - When the server offers it (`--virtual-display`, experimental), "Fit this screen" in
   the text-size menu asks for a Mac virtual display at this screen's or the connected
   monitor's native size
-- Trackpad and touch input, pinch to zoom, two-finger scroll
+- Trackpad and touch input, pinch to zoom, two-finger scroll (natural scrolling by default, like a Mac trackpad; toggle in the session toolbar or host settings)
 - Hardware keyboards and mice, plus the soft keyboard with a key bar for Esc, Tab,
   sticky Shift/Cmd/Ctrl/Opt, ⌘Space, ⌘Tab and arrows
 - External displays (USB-C/HDMI or AirPlay): the remote desktop is shown full-screen on
-  the monitor; the iPhone or iPad becomes a trackpad with the usual chrome. When the
-  server runs with `--enable-resize`, the host is resized to the monitor's native pixels.
-  Otherwise the stream is scaled and letterboxed. Unplugging returns the desktop to the
+  the monitor in both voxl and High Performance mode; the iPhone or iPad becomes a
+  trackpad with the usual chrome. In voxl mode, when the server runs with
+  `--enable-resize`, the host is resized to the monitor's native pixels. Otherwise
+  the stream is scaled and letterboxed. Unplugging returns the desktop to the
   device and restores the host's own size.
 - Relative mouse movement (pointer lock and GCMouse) while a monitor is connected; key
   repeat; Command is sent as Control on a Linux host (override in the toolbar)

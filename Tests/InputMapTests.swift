@@ -52,6 +52,41 @@ enum Tests {
         expect(InputMap.isSystemShortcutInput("h"), "h shortcut")
         expect(!InputMap.isSystemShortcutInput("1"), "digit not a captured shortcut")
 
+        // Scroll direction. Default is natural; isolate tests from the host defaults.
+        let prevScroll = UserDefaults.standard.object(forKey: InputMap.naturalScrollingKey)
+        defer {
+            if let prev = prevScroll as? Bool {
+                InputMap.naturalScrolling = prev
+            } else {
+                UserDefaults.standard.removeObject(forKey: InputMap.naturalScrollingKey)
+            }
+        }
+        UserDefaults.standard.removeObject(forKey: InputMap.naturalScrollingKey)
+        expect(InputMap.naturalScrolling, "natural scrolling is the default")
+
+        InputMap.naturalScrolling = true
+        let up = InputMap.voxlScrollDelta(from: CGPoint(x: 0, y: -10))
+        expect(up.x == 0 && up.y == 10, "natural: finger up -> positive voxl sp dy (content follows fingers), got \(up)")
+        let down = InputMap.voxlScrollDelta(from: CGPoint(x: 3, y: 10))
+        expect(down.x == -3 && down.y == -10, "natural: finger down/right -> negative voxl sp, got \(down)")
+        InputMap.naturalScrolling = false
+        let trad = InputMap.voxlScrollDelta(from: CGPoint(x: 0, y: -10))
+        expect(trad.x == 0 && trad.y == -10, "traditional: finger up -> negative voxl sp dy, got \(trad)")
+
+        InputMap.naturalScrolling = true
+        var acc: CGFloat = 0
+        let hpUp = InputMap.hpScrollTicks(translationY: -20, accumulated: &acc, perTick: 10)
+        expect(hpUp == -2, "natural: finger up -> negative HP ticks (button 4 / scroll up), got \(hpUp)")
+        acc = 0
+        let hpDown = InputMap.hpScrollTicks(translationY: 25, accumulated: &acc, perTick: 10)
+        expect(hpDown == 2, "natural: finger down -> positive HP ticks (button 5), got \(hpDown)")
+        expect(abs(acc - 5) < 0.001, "HP remainder kept, got \(acc)")
+        InputMap.naturalScrolling = false
+        acc = 0
+        let hpTrad = InputMap.hpScrollTicks(translationY: -20, accumulated: &acc, perTick: 10)
+        expect(hpTrad == 2, "traditional: finger up keeps the old inverted HP ticks, got \(hpTrad)")
+        expect(InputMap.hpScrollTicks(translationY: 3, accumulated: &acc, perTick: 10) == 0, "HP sub-tick does not emit")
+
         if failed == 0 {
             print("InputMapTests: all passed")
         } else {
